@@ -1,0 +1,32 @@
+# Catálogo de strings em português para docs gerada e mensagens da CLI.
+lang_name = "Português"
+
+[docs]
+title = "Arquitetura de serviços"
+index_title = "Índice de serviços"
+service_page_title = "Serviço: {service}"
+namespace = "Namespace"
+image = "Imagem"
+environment = "Ambiente"
+incoming = "Dependências de entrada (quem o chama)"
+outgoing = "Dependências de saída (o que ele chama)"
+datastores = "Armazenamentos de dados"
+external = "Dependências externas"
+none = "nenhuma"
+diagram = "Diagrama"
+provenance_explicit = "explícito"
+provenance_heuristic = "heurístico (inferido)"
+source = "Fonte"
+
+[edge]
+http_calls = "chama"
+reads_from = "lê de"
+writes_to = "escreve em"
+caches_in = "faz cache em"
+queues_to = "enfileira em"
+authenticates_via = "autentica via"
+calls_external = "chama externo"
+routes_to = "roteia para"
+depends_on_chart = "depende do chart"
+references = "monta config"
+in_namespace = "no namespace"

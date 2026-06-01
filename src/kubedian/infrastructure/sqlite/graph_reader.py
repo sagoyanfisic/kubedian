@@ -1,0 +1,158 @@
+"""Read the service graph back from SQLite.
+
+Shared by every read surface (vault/mermaid/docs exporters and the MCP server),
+so graph traversal logic lives in exactly one place. The DB is opened read-only.
+"""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+from dataclasses import dataclass
+from pathlib import Path
+
+from kubedian.domain.entities.graph import (
+    Edge,
+    EdgeType,
+    Environment,
+    Graph,
+    Node,
+    NodeType,
+    Provenance,
+    Signal,
+)
+
+
+@dataclass
+class IndexMeta:
+    repo_path: str | None
+    indexed_at: str | None
+    kustomize_version: str | None
+    service_count: int
+    edge_count: int
+    render_failures: int
+
+
+class GraphReader:
+    def __init__(self, db_path: Path, check_same_thread: bool = True):
+        self.db_path = Path(db_path)
+        if not self.db_path.exists():
+            raise FileNotFoundError(
+                f"no index at {self.db_path}. Run `kubedian index --repo <repo>` first."
+            )
+        uri = f"file:{self.db_path}?mode=ro"
+        self._conn = sqlite3.connect(uri, uri=True, check_same_thread=check_same_thread)
+        self._conn.row_factory = sqlite3.Row
+
+    # -- nodes ----------------------------------------------------------------
+    def _node(self, row: sqlite3.Row) -> Node:
+        return Node(
+            id=row["id"],
+            type=NodeType(row["type"]),
+            name=row["name"],
+            namespace=row["namespace"],
+            attrs=json.loads(row["attrs"] or "{}"),
+        )
+
+    def node(self, node_id: str) -> Node | None:
+        row = self._conn.execute("SELECT * FROM nodes WHERE id = ?", (node_id,)).fetchone()
+        return self._node(row) if row else None
+
+    def nodes(self) -> list[Node]:
+        return [self._node(r) for r in self._conn.execute("SELECT * FROM nodes")]
+
+    def search(self, query: str, limit: int = 25) -> list[Node]:
+        like = f"%{query.lower()}%"
+        rows = self._conn.execute(
+            "SELECT * FROM nodes WHERE lower(name) LIKE ? OR lower(id) LIKE ? "
+            "ORDER BY (type='service') DESC, name LIMIT ?",
+            (like, like, limit),
+        )
+        return [self._node(r) for r in rows]
+
+    # -- edges ----------------------------------------------------------------
+    def _edge(self, row: sqlite3.Row) -> Edge:
+        return Edge(
+            src_id=row["src_id"],
+            dst_id=row["dst_id"],
+            type=EdgeType(row["type"]),
+            environment=Environment(row["environment"]),
+            provenance=Provenance(row["provenance"]),
+            signal=Signal(row["signal"]),
+            source_file=row["source_file"],
+            source_locator=row["source_locator"],
+            confidence=row["confidence"],
+            attrs=json.loads(row["attrs"] or "{}"),
+        )
+
+    def _env_clause(self, environment: Environment | None) -> tuple[str, list]:
+        return (" AND environment = ?", [environment.value]) if environment else ("", [])
+
+    def callees(self, node_id: str, environment: Environment | None = None) -> list[Edge]:
+        clause, params = self._env_clause(environment)
+        rows = self._conn.execute(
+            f"SELECT * FROM edges WHERE src_id = ?{clause} ORDER BY type", [node_id, *params]
+        )
+        return [self._edge(r) for r in rows]
+
+    def callers(self, node_id: str, environment: Environment | None = None) -> list[Edge]:
+        clause, params = self._env_clause(environment)
+        rows = self._conn.execute(
+            f"SELECT * FROM edges WHERE dst_id = ?{clause} ORDER BY type", [node_id, *params]
+        )
+        return [self._edge(r) for r in rows]
+
+    def edges(self, environment: Environment | None = None) -> list[Edge]:
+        clause, params = self._env_clause(environment)
+        where = (" WHERE 1=1" + clause) if clause else ""
+        rows = self._conn.execute(f"SELECT * FROM edges{where}", params)
+        return [self._edge(r) for r in rows]
+
+    def graph(self, environment: Environment | None = None) -> Graph:
+        """Load the full graph, optionally filtered to one environment.
+
+        Only nodes touched by the kept edges (plus all service nodes) are kept.
+        """
+        edges = self.edges(environment)
+        graph = Graph()
+        keep: set[str] = set()
+        for e in edges:
+            keep.add(e.src_id)
+            keep.add(e.dst_id)
+        for n in self.nodes():
+            if n.type == NodeType.SERVICE or n.id in keep:
+                graph.add_node(n)
+        graph.edges = edges
+        return graph
+
+    def impact(self, node_id: str, environment: Environment | None = None, max_depth: int = 5) -> list[str]:
+        """Transitive callers (blast radius) up to ``max_depth`` hops."""
+        clause, params = self._env_clause(environment)
+        sql = f"""
+            WITH RECURSIVE blast(id, depth) AS (
+                SELECT ?, 0
+                UNION
+                SELECT e.src_id, b.depth + 1
+                FROM edges e JOIN blast b ON e.dst_id = b.id
+                WHERE b.depth < ?{clause}
+            )
+            SELECT DISTINCT id FROM blast WHERE id != ?
+        """
+        rows = self._conn.execute(sql, [node_id, max_depth, *params, node_id])
+        return [r["id"] for r in rows]
+
+    def meta(self) -> IndexMeta | None:
+        row = self._conn.execute("SELECT * FROM index_meta WHERE id = 1").fetchone()
+        if not row:
+            return None
+        return IndexMeta(
+            repo_path=row["repo_path"],
+            indexed_at=row["indexed_at"],
+            kustomize_version=row["kustomize_version"],
+            service_count=row["service_count"],
+            edge_count=row["edge_count"],
+            render_failures=row["render_failures"],
+        )
+
+    def close(self) -> None:
+        self._conn.close()

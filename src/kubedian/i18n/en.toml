@@ -1,0 +1,32 @@
+# English string catalog for generated docs and CLI messages.
+lang_name = "English"
+
+[docs]
+title = "Service Architecture"
+index_title = "Services index"
+service_page_title = "Service: {service}"
+namespace = "Namespace"
+image = "Image"
+environment = "Environment"
+incoming = "Incoming dependencies (who calls this)"
+outgoing = "Outgoing dependencies (what this calls)"
+datastores = "Datastores"
+external = "External dependencies"
+none = "none"
+diagram = "Diagram"
+provenance_explicit = "explicit"
+provenance_heuristic = "heuristic (inferred)"
+source = "Source"
+
+[edge]
+http_calls = "calls"
+reads_from = "reads from"
+writes_to = "writes to"
+caches_in = "caches in"
+queues_to = "queues to"
+authenticates_via = "authenticates via"
+calls_external = "calls external"
+routes_to = "routes to"
+depends_on_chart = "depends on chart"
+references = "mounts config"
+in_namespace = "in namespace"

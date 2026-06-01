@@ -1,0 +1,11 @@
+services:
+  kubedian-mcp:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      KUBEDIAN_DB: /data/graph.db
+      KUBEDIAN_MCP_TRANSPORT: http
+    volumes:
+      # Pre-built index (run `kubedian index --repo <repo> --db ./graph.db` first).
+      - ./graph.db:/data/graph.db:ro

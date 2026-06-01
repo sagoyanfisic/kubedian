@@ -1,0 +1,32 @@
+# Catálogo de cadenas en español para docs generada y mensajes del CLI.
+lang_name = "Español"
+
+[docs]
+title = "Arquitectura de servicios"
+index_title = "Índice de servicios"
+service_page_title = "Servicio: {service}"
+namespace = "Namespace"
+image = "Imagen"
+environment = "Entorno"
+incoming = "Dependencias entrantes (quién lo llama)"
+outgoing = "Dependencias salientes (a qué llama)"
+datastores = "Almacenes de datos"
+external = "Dependencias externas"
+none = "ninguna"
+diagram = "Diagrama"
+provenance_explicit = "explícito"
+provenance_heuristic = "heurístico (inferido)"
+source = "Fuente"
+
+[edge]
+http_calls = "llama a"
+reads_from = "lee de"
+writes_to = "escribe en"
+caches_in = "cachea en"
+queues_to = "encola en"
+authenticates_via = "se autentica vía"
+calls_external = "llama externo"
+routes_to = "enruta a"
+depends_on_chart = "depende del chart"
+references = "monta config"
+in_namespace = "en namespace"

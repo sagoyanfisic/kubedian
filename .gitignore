@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Kubedian index + generated exports (regenerable; not committed)
+.kubedian/
+/vault/
+/kubedian-docs/
+*.db
+*.db-wal
+*.db-shm
+
+# Tooling
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.DS_Store
+.idea/
+.vscode/
+
+# Secrets / local env (never commit)
+.env
+.env.*
+*.decrypted*.yaml

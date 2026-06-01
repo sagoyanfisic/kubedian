@@ -1,0 +1,41 @@
+# Keep the Docker build context (and image) small — the Dockerfile does `COPY . /app`.
+# Virtualenvs & build artifacts (huge / machine-specific)
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+__pycache__/
+*.py[cod]
+
+# VCS & CI
+.git/
+.github/
+.gitignore
+
+# Kubedian-generated data (regenerable; never bake into the image)
+.kubedian/
+vault/
+kubedian-docs/
+*.db
+*.db-wal
+*.db-shm
+
+# Tests & dev tooling (not needed at runtime)
+tests/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Editor / OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Local docs/exports & secrets
+docs/
+*.env
+.env*
