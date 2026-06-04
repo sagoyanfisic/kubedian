@@ -161,6 +161,9 @@ def export_mermaid_cmd(
     env: Optional[str] = typer.Option(None, "--env", "-e", help="Environment filter."),
     lang: str = typer.Option(DEFAULT_LANG, "--lang", "-l", help="en|es|pt."),
     fenced: bool = typer.Option(True, "--fenced/--raw", help="Wrap in a ```mermaid block."),
+    include_isolated: bool = typer.Option(
+        False, "--include-isolated", help="Also draw edge-less nodes (e.g. a CronJob with no deps)."
+    ),
 ) -> None:
     """Generate a MermaidJS architecture diagram (full topology or focused)."""
     _check_lang(lang)
@@ -172,7 +175,7 @@ def export_mermaid_cmd(
         node_id = _find_node_id(reader, focus)
         diagram = mermaid_renderer.render_focus(graph, node_id, lang=lang)
     else:
-        diagram = mermaid_renderer.render_flowchart(graph, lang=lang)
+        diagram = mermaid_renderer.render_flowchart(graph, lang=lang, include_isolated=include_isolated)
     reader.close()
 
     body = f"```mermaid\n{diagram.rstrip()}\n```\n" if fenced else diagram
@@ -253,7 +256,7 @@ def context(
     repo: Optional[Path] = typer.Option(None, "--repo", "-r"),
     json: bool = typer.Option(False, "--json"),
 ) -> None:
-    """Full context for a service: who calls it, what it calls, datastores, externals."""
+    """Full context for a service: identity (kind/replicas/ports/SA), who calls it, what it calls, datastores, externals, routing, storage, identity, autoscaling."""
     reader = _open_reader(db, repo)
     _emit(queries.context(reader, service, _parse_env(env)), json)
     reader.close()
@@ -281,7 +284,7 @@ def callees(
     repo: Optional[Path] = typer.Option(None, "--repo", "-r"),
     json: bool = typer.Option(False, "--json"),
 ) -> None:
-    """Find everything a service depends on (services, db, cache, queue, external)."""
+    """Find everything a service depends on (services, db, cache, queue, external, storage/PVC, service account)."""
     reader = _open_reader(db, repo)
     _emit(queries.callees(reader, service, _parse_env(env)), json)
     reader.close()
@@ -297,7 +300,7 @@ def trace(
     repo: Optional[Path] = typer.Option(None, "--repo", "-r"),
     json: bool = typer.Option(False, "--json"),
 ) -> None:
-    """Find a request path between two services (transitive http_calls)."""
+    """Find a request path between two services (transitive http_calls + Istio/Ingress routes, so paths through a gateway are traced)."""
     reader = _open_reader(db, repo)
     _emit(queries.trace(reader, source, target, _parse_env(env), max_depth), json)
     reader.close()

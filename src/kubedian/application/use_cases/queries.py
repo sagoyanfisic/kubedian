@@ -18,13 +18,18 @@ _DATASTORE_TYPES = {NodeType.DATABASE, NodeType.CACHE, NodeType.QUEUE}
 # serialisation helpers
 # --------------------------------------------------------------------------- #
 def node_dict(node) -> dict:
-    return {
+    d = {
         "id": node.id,
         "type": node.type.value,
         "name": node.name,
         "namespace": node.namespace,
         "image": node.attrs.get("image"),
     }
+    # Workload facts kept on the (collapsed) service node, when present.
+    for key in ("workload_kind", "replicas", "ports", "service_account", "nodepool"):
+        if node.attrs.get(key) is not None:
+            d[key] = node.attrs[key]
+    return d
 
 
 def edge_dict(edge, reader: GraphReader, *, other: str) -> dict:
@@ -41,6 +46,13 @@ def edge_dict(edge, reader: GraphReader, *, other: str) -> dict:
         "source_locator": edge.source_locator,
         "locators": edge.attrs.get("locators"),
     }
+
+
+def _scaler_dict(edge, reader: GraphReader) -> dict:
+    """An incoming SCALES edge: relabel the source (the HPA) as `autoscaler`."""
+    d = edge_dict(edge, reader, other="src_id")
+    d["autoscaler"] = d.pop("service")
+    return d
 
 
 def find_service_id(reader: GraphReader, ref: str) -> str | None:
@@ -66,7 +78,7 @@ def context(reader: GraphReader, service: str, env: Environment | None) -> dict:
     node = reader.node(node_id)
     callees = reader.callees(node_id, env)
     callers = reader.callers(node_id, env)
-    datastores, external, calls = [], [], []
+    datastores, external, calls, storage, identity, routing = [], [], [], [], [], []
     for e in callees:
         dst = reader.node(e.dst_id)
         if dst and dst.type in _DATASTORE_TYPES:
@@ -75,6 +87,12 @@ def context(reader: GraphReader, service: str, env: Environment | None) -> dict:
             external.append(edge_dict(e, reader, other="dst_id"))
         elif e.type == EdgeType.HTTP_CALLS:
             calls.append(edge_dict(e, reader, other="dst_id"))
+        elif e.type == EdgeType.MOUNTS:
+            storage.append(edge_dict(e, reader, other="dst_id"))
+        elif e.type == EdgeType.RUNS_AS:
+            identity.append(edge_dict(e, reader, other="dst_id"))
+        elif e.type == EdgeType.ROUTES_TO:
+            routing.append(edge_dict(e, reader, other="dst_id"))
     return {
         "service": node_dict(node),
         "calls": calls,
@@ -85,6 +103,12 @@ def context(reader: GraphReader, service: str, env: Environment | None) -> dict:
         ],
         "datastores": datastores,
         "external_dependencies": external,
+        "routing": routing,
+        "storage": storage,
+        "identity": identity,
+        # HPA -> service is an incoming SCALES edge; surface the HPA as `autoscaler`
+        # rather than the generic `service` key edge_dict uses for src direction.
+        "autoscaling": [_scaler_dict(e, reader) for e in callers if e.type == EdgeType.SCALES],
     }
 
 
@@ -165,7 +189,10 @@ def _bfs_path(reader, src, dst, env, max_depth):
         if len(path) > max_depth:
             continue
         for e in reader.callees(node, env):
-            if e.type != EdgeType.HTTP_CALLS:
+            # Follow actual calls and declared routing (gateways route via
+            # VirtualService/Ingress); ALLOWS_TO is a permission, not a call, so
+            # it is deliberately excluded from request-path tracing.
+            if e.type not in (EdgeType.HTTP_CALLS, EdgeType.ROUTES_TO):
                 continue
             if e.dst_id not in seen:
                 seen.add(e.dst_id)

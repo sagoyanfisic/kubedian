@@ -1,19 +1,25 @@
 """Shared dependencies for the MCP tools.
 
-The index is read-only and static between reindexes, so we cache a single
-GraphReader for the server's lifetime. The DB path comes from ``KUBEDIAN_DB``
-(or ``KUBEDIAN_REPO``'s default ``.kubedian/graph.db``, or ./.kubedian/graph.db).
+A single GraphReader is cached for the server's lifetime, but it is **rebuilt
+automatically when the graph DB changes on disk** (its path or mtime) — so a
+``kubedian index`` is picked up on the next query without restarting the server.
+The DB path comes from ``KUBEDIAN_DB`` (or ``KUBEDIAN_REPO``'s default
+``.kubedian/graph.db``, or ./.kubedian/graph.db).
 """
 
 from __future__ import annotations
 
 import os
-from functools import lru_cache
+import threading
 from pathlib import Path
 
 from kubedian.config import default_db_path
 from kubedian.domain.entities.graph import Environment
 from kubedian.infrastructure.sqlite.graph_reader import GraphReader
+
+_lock = threading.Lock()
+_reader: GraphReader | None = None
+_reader_key: tuple[str, int] | None = None  # (db path, mtime_ns)
 
 
 def resolve_db_path() -> Path:
@@ -24,9 +30,40 @@ def resolve_db_path() -> Path:
     return default_db_path(Path.cwd())
 
 
-@lru_cache(maxsize=1)
+def _db_key(path: Path) -> tuple[str, int]:
+    try:
+        return (str(path), path.stat().st_mtime_ns)
+    except OSError:
+        return (str(path), 0)
+
+
 def get_reader() -> GraphReader:
-    return GraphReader(resolve_db_path(), check_same_thread=False)
+    """Return a cached GraphReader, transparently reopened when the DB changes."""
+    global _reader, _reader_key
+    key = _db_key(resolve_db_path())
+    with _lock:
+        if _reader is None or _reader_key != key:
+            if _reader is not None:
+                try:
+                    _reader.close()
+                except Exception:  # pragma: no cover - close is best-effort
+                    pass
+            _reader = GraphReader(Path(key[0]), check_same_thread=False)
+            _reader_key = key
+        return _reader
+
+
+def reset_reader() -> None:
+    """Drop the cached reader (used by tests and on shutdown)."""
+    global _reader, _reader_key
+    with _lock:
+        if _reader is not None:
+            try:
+                _reader.close()
+            except Exception:  # pragma: no cover
+                pass
+        _reader = None
+        _reader_key = None
 
 
 def parse_env(environment: str | None) -> Environment | None:

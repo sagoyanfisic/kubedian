@@ -123,6 +123,10 @@ def write_sample_repo(root: Path) -> Path:
             app: service-b
         spec:
           template:
+            metadata:
+              labels:
+                app: service-b
+                component: api
             spec:
               containers:
                 - name: api
@@ -152,4 +156,245 @@ def write_sample_repo(root: Path) -> Path:
           - ../../base
         """,
     )
+
+    # --- gateway: routing (Istio VS + Ingress), generators, NetworkPolicy -----
+    # Its overlay references a missing file → forced raw fallback, which is where
+    # configMapGenerator/secretGenerator literals would otherwise be lost.
+    _w(
+        repo / "gateway/base/deployment.yaml",
+        """
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: gateway
+          namespace: placeholder
+          labels:
+            app: gateway
+        spec:
+          template:
+            spec:
+              containers:
+                - name: api
+                  image: example/gateway:latest
+                  envFrom:
+                    - configMapRef:
+                        name: gateway-cm
+                    - secretRef:
+                        name: gateway-sc
+        """,
+    )
+    _w(
+        repo / "gateway/base/virtualservice.yaml",
+        """
+        apiVersion: networking.istio.io/v1beta1
+        kind: VirtualService
+        metadata:
+          name: gateway
+          namespace: placeholder
+        spec:
+          hosts:
+            - gateway.example.com
+          gateways:
+            - public-gw
+          http:
+            - route:
+                - destination:
+                    host: service-b.ns-b.svc.cluster.local
+        """,
+    )
+    _w(
+        repo / "gateway/base/gateway.yaml",
+        """
+        apiVersion: networking.istio.io/v1beta1
+        kind: Gateway
+        metadata:
+          name: public-gw
+          namespace: placeholder
+        spec:
+          selector:
+            istio: ingressgateway
+          servers:
+            - port:
+                number: 443
+                name: https
+                protocol: HTTPS
+              hosts:
+                - gateway.example.com
+        """,
+    )
+    _w(
+        repo / "gateway/base/ingress.yaml",
+        """
+        apiVersion: networking.k8s.io/v1
+        kind: Ingress
+        metadata:
+          name: gateway
+          namespace: placeholder
+        spec:
+          rules:
+            - host: gw.example.com
+              http:
+                paths:
+                  - path: /
+                    pathType: Prefix
+                    backend:
+                      service:
+                        name: gateway
+        """,
+    )
+    _w(
+        repo / "gateway/base/network-policy.yaml",
+        """
+        apiVersion: networking.k8s.io/v1
+        kind: NetworkPolicy
+        metadata:
+          name: gateway
+          namespace: placeholder
+        spec:
+          podSelector:
+            matchLabels:
+              app: gateway
+          policyTypes:
+            - Ingress
+            - Egress
+          egress:
+            - to:
+                - namespaceSelector:
+                    matchLabels:
+                      kubernetes.io/metadata.name: ns-b
+                  podSelector:
+                    matchLabels:
+                      component: api  # non-`app` key: resolves via label-set match
+          ingress:
+            - from:
+                - namespaceSelector:
+                    matchLabels:
+                      kubernetes.io/metadata.name: ns-a
+                  podSelector:
+                    matchLabels:
+                      app: service-a
+              ports:
+                - port: 8000
+        """,
+    )
+    # The literal KEY name (MS_CLIENT) is arbitrary; the edge comes from the VALUE
+    # being an in-cluster DNS URL. The secretGenerator value must never leak.
+    _w(
+        repo / "gateway/overlays/staging/kustomization.yaml",
+        """
+        namespace: ns-gw
+        resources:
+          - ../../base
+          - does-not-exist.yaml
+        configMapGenerator:
+          - name: gateway-cm
+            literals:
+              - MS_CLIENT=http://service-b.ns-b.svc.cluster.local/graphql
+              - PLAYGROUND="true"
+        secretGenerator:
+          - name: gateway-sc
+            literals:
+              - POSTGRES_HOST=super-secret-db-host.internal
+        """,
+    )
+
+    # --- edge-proxy: a Service in ns-b that fronts service-b's pods by label ---
+    # Its name differs from the workload it selects, so it exercises SELECTS.
+    _w(
+        repo / "edge-proxy/base/service.yaml",
+        """
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: edge-proxy
+          namespace: placeholder
+        spec:
+          selector:
+            app: service-b
+          ports:
+            - port: 80
+        """,
+    )
+    _w(
+        repo / "edge-proxy/overlays/staging/kustomization.yaml",
+        """
+        namespace: ns-b
+        resources:
+          - ../../base
+        """,
+    )
+
+    # --- data-store: StatefulSet exercising storage (PVC), HPA, ServiceAccount --
+    _w(
+        repo / "data-store/base/statefulset.yaml",
+        """
+        apiVersion: apps/v1
+        kind: StatefulSet
+        metadata:
+          name: data-store
+          namespace: placeholder
+          labels:
+            app: data-store
+        spec:
+          replicas: 3
+          template:
+            metadata:
+              labels:
+                app: data-store
+            spec:
+              serviceAccountName: data-sa
+              containers:
+                - name: db
+                  image: example/data-store:latest
+                  ports:
+                    - containerPort: 5432
+          volumeClaimTemplates:
+            - metadata:
+                name: data
+              spec:
+                storageClassName: gp2
+                resources:
+                  requests:
+                    storage: 10Gi
+        """,
+    )
+    _w(
+        repo / "data-store/base/serviceaccount.yaml",
+        """
+        apiVersion: v1
+        kind: ServiceAccount
+        metadata:
+          name: data-sa
+          namespace: placeholder
+        """,
+    )
+    _w(
+        repo / "data-store/base/hpa.yaml",
+        """
+        apiVersion: autoscaling/v2
+        kind: HorizontalPodAutoscaler
+        metadata:
+          name: data-store
+          namespace: placeholder
+        spec:
+          scaleTargetRef:
+            apiVersion: apps/v1
+            kind: StatefulSet
+            name: data-store
+          minReplicas: 3
+          maxReplicas: 10
+        """,
+    )
+    _w(
+        repo / "data-store/overlays/staging/kustomization.yaml",
+        """
+        namespace: ns-data
+        resources:
+          - ../../base
+        """,
+    )
     return repo
+
+
+# Secret value planted in the gateway's secretGenerator; must never reach the graph.
+GATEWAY_SECRET_VALUE = "super-secret-db-host.internal"

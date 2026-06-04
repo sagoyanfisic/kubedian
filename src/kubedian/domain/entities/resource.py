@@ -51,10 +51,23 @@ class ContainerView:
 class DeploymentView:
     resource: K8sResource
     app_label: str | None
+    # Pod-template labels — what Service/NetworkPolicy selectors actually match.
+    pod_labels: dict[str, str] = field(default_factory=dict)
     containers: list[ContainerView] = field(default_factory=list)
     # Secret/ConfigMap names mounted as volumes (config-file-driven services).
     secret_volumes: tuple[str, ...] = ()
     configmap_volumes: tuple[str, ...] = ()
+    # Distinguishing workload facts kept on the (collapsed) service node.
+    workload_kind: str = "Deployment"
+    replicas: int | None = None
+    ports: tuple[int, ...] = ()
+    service_account: str | None = None
+    # Node pool the workload is scheduled onto, from the `purpose` node label
+    # (nodeSelector / required nodeAffinity). None when the workload doesn't pin a pool.
+    nodepool: str | None = None
+    # PersistentVolumeClaim names mounted, plus StatefulSet volumeClaimTemplates.
+    pvc_volumes: tuple[str, ...] = ()
+    volume_claim_templates: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

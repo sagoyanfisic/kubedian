@@ -11,11 +11,12 @@ namespaces e overlays — e reconstrói o grafo de serviços que o próprio Kube
 ## Para que serve
 
 O Kubedian constrói um **grafo de dependências entre seus serviços**: quem chama quem por HTTP,
-qual banco de dados / cache / fila cada um usa e de quais APIs externas depende. Ele extrai tudo
-isso **direto do YAML que você já tem** — overlays do Kustomize, variáveis de ambiente dos
-Deployments, ConfigMaps compartilhados, Helm charts, roteamento Istio/Ingress — e o expõe como
-um grafo SQLite, uma CLI, um servidor MCP para agentes de IA, diagramas Mermaid e documentação
-em Markdown.
+qual banco de dados / cache / fila cada um usa, de quais APIs externas depende, e a infra
+estrutural ao redor de cada workload — roteamento Istio/Ingress, os PVCs que ele monta, o HPA que
+o escala, sua ServiceAccount, a conectividade de NetworkPolicy. Ele extrai tudo isso **direto do
+YAML que você já tem** — overlays do Kustomize, variáveis de ambiente dos Deployments, ConfigMaps
+compartilhados, geradores, Helm charts — e o expõe como um grafo SQLite, uma CLI, um servidor MCP
+para agentes de IA, diagramas Mermaid e documentação em Markdown.
 
 ## O problema que resolve
 
@@ -43,8 +44,32 @@ pip install kubedian                 # core: index + grafo + diagramas + docs
 pip install "kubedian[mcp]"          # + servidor MCP
 ```
 
-Requer o binário externo [`kustomize`](https://kustomize.io) no `PATH` para renderização
-precisa; o Kubedian recorre ao parsing de YAML bruto se ele faltar.
+### Requisito: `kustomize`
+
+O Kubedian invoca o binário externo [`kustomize`](https://kustomize.io) para renderizar cada
+overlay com precisão — o transformer de namespace, os patches, os prefixos/sufixos de nome e os
+generators. Instale-o e garanta que esteja no seu `PATH`:
+
+```bash
+# macOS
+brew install kustomize
+
+# Linux (instalador oficial → ./kustomize, depois mova-o para o seu PATH)
+curl -s "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash
+sudo mv kustomize /usr/local/bin/
+
+# Windows (qualquer um destes)
+choco install kustomize          # Chocolatey
+scoop install kustomize          # Scoop
+winget install Kubernetes.kustomize
+
+kustomize version                # verifique que está no PATH
+```
+
+Se faltar o `kustomize` — ou um overlay não compilar (ex.: um generator SOPS/ksops) — o Kubedian
+**nunca falha**: ele recorre ao parsing do YAML bruto, registra o `render_mode` e reporta quantos
+overlays caíram em fallback no `kubedian status` (`render_failures`). O fallback ainda produz um
+grafo, só com fidelidade menor (patches e prefixos de nome não são aplicados).
 
 ## Uso
 
@@ -54,7 +79,7 @@ kubedian index --env production
 
 # 2. Consultar a topologia
 kubedian status
-kubedian context  orders-service        # quem o chama, o que ele chama, datastores, externos
+kubedian context  orders-service        # entrada, saída, datastores, externos, roteamento, storage, identidade, autoscaling
 kubedian callers   catalog-service      # dependências de entrada
 kubedian callees   orders-service        # dependências de saída
 kubedian trace     checkout-service orders-service
@@ -79,16 +104,15 @@ um ambiente específico (development | staging | production | test).
 
 ```console
 $ kubedian callers catalog-service --env production
- - checkout-service   (explicit, service-discovery.CATALOG_API_URL)
- - orders-service     (explicit, service-discovery.CATALOG_API_URL)
- - pricing-service    (explicit, service-discovery.CATALOG_API_URL)
- - promo-service      (explicit, service-discovery.CATALOG_API_URL)
- - inventory-service  (explicit, service-discovery.CATALOG_API_URL)
- - delivery-service   (explicit, service-discovery.CATALOG_API_URL)
- - auth-service       (explicit, service-discovery.CATALOG_API_URL)
- - web-frontend       (explicit, service-discovery.CATALOG_API_URL)
- - erp-connector      (explicit, service-discovery.CATALOG_API_URL)
+ - checkout-service   (heuristic, shared_catalog: service-discovery.CATALOG_API_URL)
+ - orders-service     (heuristic, shared_catalog: service-discovery.CATALOG_API_URL)
+ - pricing-service    (heuristic, shared_catalog: service-discovery.CATALOG_API_URL)
+ - web-frontend       (explicit,  env própria CATALOG_URL=http://catalog-service…)
 ```
+
+> Quando muitos serviços montam o *mesmo* ConfigMap de discovery, ter uma URL disponível não
+> prova uma chamada, então essas arestas são marcadas honestamente como `heuristic`
+> (`shared_catalog`). Um chamador cuja própria config nomeia a URL diretamente segue `explicit`.
 
 **Com o que um serviço fala?**
 
@@ -109,10 +133,13 @@ Ele nunca roda o cluster — reconstrói cada aresta a partir de um sinal concre
 
 | Sinal no YAML | Aresta gerada | Proveniência |
 |---------------|---------------|--------------|
-| Uma entrada do **ConfigMap** de service-discovery — `CATALOG_API_URL: http://catalog-service.catalog.svc.cluster.local` consumida via `envFrom` | `checkout-service → catalog-service` (`http_calls`) | `explicit` |
+| Uma entrada de **ConfigMap**/`configMapGenerator` de service-discovery — `CATALOG_API_URL: http://catalog-service.catalog.svc.cluster.local` consumida via `envFrom` | `checkout-service → catalog-service` (`http_calls`) | `explicit` (ou `heuristic` se for um *catálogo compartilhado*) |
 | Uma **env var** literal cujo valor é um DNS interno (`*.svc.cluster.local`) | quem a define → esse serviço (`http_calls`) | `explicit` |
+| Um **VirtualService / Ingress / Gateway** do Istio roteando para um backend | gateway / ingress-host → serviço (`routes_to`) | `explicit` |
+| Uma **NetworkPolicy** que permite um peer (por selector) em egress/ingress | origem → peer (`allows_to` — *permitido*, não observado) | `explicit` |
 | O **nome de uma chave de secret** como `POSTGRES_HOST` / `RABBITMQ_HOST` / `REDIS_URL` (o valor segue criptografado) | serviço → seu banco / fila / cache | `heuristic` |
 | Uma chave `*_URL` apontando para um host fora do cluster (ex.: `EMAIL_API_URL`) | serviço → API externa | `heuristic` |
+| Os `volumeClaimTemplates` / **PVC** montado de um workload, seu **HPA** `scaleTargetRef`, seu `serviceAccountName` | `mounts` → storage · `scales` (HPA→workload) · `runs_as` → ServiceAccount | `explicit` |
 | Um **diagrama Mermaid** no seu `docs/` desenhando `A --> B` | `A → B` | `documented` |
 | Uma entrada `helmCharts[]` / um ConfigMap ou Secret montado | `depends_on_chart` / `references` | `explicit` |
 
@@ -197,8 +224,8 @@ aplicado a um cluster e nenhum secret é descriptografado:
 |-------|-----------|
 | **discover** | Percorre o repo e encontra cada unidade renderizável — os overlays do Kustomize por serviço e ambiente. |
 | **render** | Roda `kustomize build` em cada overlay para obter os objetos resolvidos reais (transformer de namespace, patches, prefixos de nome). Recorre ao parsing de YAML bruto se um overlay não compilar (ex.: um generator SOPS/ksops), então um serviço quebrado nunca aborta o índice. |
-| **extract** | Parseia os objetos Kubernetes em views tipadas: Deployments e seu env / `envFrom`, Services, ConfigMaps, Secrets (só nomes de chaves), refs de Helm, volumes montados, roteamento Istio/Ingress. |
-| **resolve** | Transforma recursos em grafo: resolve DNS interno (`*.svc.cluster.local`), as URLs do ConfigMap de service-discovery, heurísticas de chaves de secrets (`POSTGRES_HOST` → um banco), dependências de Helm e configs montadas — cada uma como aresta com proveniência. |
+| **extract** | Parseia os objetos em views tipadas: cada workload (Deployment / StatefulSet / DaemonSet / Job / CronJob) com seu env / `envFrom` / portas / `serviceAccountName` / PVCs, além de Services, ConfigMaps, Secrets (só nomes de chaves), `configMapGenerator`/`secretGenerator`, refs de Helm, e objetos Istio/Ingress/NetworkPolicy/HPA/PVC/ServiceAccount. |
+| **resolve** | Monta o grafo com **um nó por workload** (um bundle de api + worker + beat + flower vira um nó cada; Jobs/CronJobs têm seu próprio tipo). Resolve DNS interno, URLs do ConfigMap de discovery (catálogos compartilhados rebaixados a `heuristic`), heurísticas de chaves de secrets, roteamento Istio/Ingress/Gateway, conectividade de NetworkPolicy, montagens de PVC, escalonamento de HPA, identidade de ServiceAccount e deps de Helm — cada uma aresta com proveniência. O **nome** do workload é o alias autoritativo, então um `app` compartilhado não desvia uma aresta. |
 | **ingest** *(opcional, `--docs`)* | Parseia os diagramas Mermaid do seu `docs/` e adiciona as arestas que eles afirmam. |
 | **store** | Escreve nós e arestas num grafo **SQLite** local — a única fonte de verdade. |
 | **serve / export** | A CLI e o servidor MCP leem o grafo; os exporters o renderizam em diagramas Mermaid ou docs em Markdown. |
