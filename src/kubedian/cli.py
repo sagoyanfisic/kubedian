@@ -12,6 +12,7 @@ import json as _json
 
 from kubedian import __version__
 from kubedian.application.pipeline.index import index_repo
+from kubedian.application.pipeline.sync import sync_envs
 from kubedian.application.use_cases import queries
 from kubedian.config import DEFAULT_LANG, SUPPORTED_LANGS, default_db_path
 from kubedian.domain.entities.graph import Environment
@@ -74,6 +75,64 @@ def index(
 
     report = _index_with_progress(target, db_path, environment, docs_path)
     _print_summary(report, environment)
+
+
+@app.command(name="sync-envs")
+def sync_envs_cmd(
+    path: Optional[Path] = typer.Argument(None, help="Manifests repo (default: current directory)."),
+    repo: Optional[Path] = typer.Option(None, "--repo", "-r", help="Manifests repo (alias for the positional path)."),
+    env: Optional[str] = typer.Option(None, "--env", "-e", help="Limit to one environment."),
+    db: Optional[Path] = typer.Option(None, "--db", help="SQLite path (default: <repo>/.kubedian/graph.db)."),
+) -> None:
+    """Refresh only the secret/env subset (key names + file locations, never values).
+
+    Re-reads the manifests and mark-and-sweeps the secret/configmap nodes and
+    env-derived edges: new keys are added, vanished ones are deleted, and the rest
+    of the graph (services, jobs, real call edges) is left untouched. Requires an
+    existing index — run `kubedian index` first.
+    """
+    target = repo or path or Path.cwd()
+    if not target.is_dir():
+        raise typer.BadParameter(f"{target} is not a directory")
+    environment = _parse_env(env)
+    db_path = db or default_db_path(target)
+    if not db_path.exists():
+        raise typer.BadParameter(f"no index at {db_path} — run `kubedian index` first")
+
+    stats = _sync_with_progress(target, db_path, environment)
+    typer.secho(
+        f"✓ sync-envs (generation {stats['generation']})", fg=typer.colors.GREEN, bold=True
+    )
+    typer.echo(
+        f"  nodes: +{stats['nodes_written']} written, -{stats['nodes_swept']} swept · "
+        f"edges: +{stats['edges_written']} written, -{stats['edges_swept']} swept"
+    )
+
+
+def _sync_with_progress(target: Path, db_path: Path, environment) -> dict:
+    try:
+        from rich.progress import (
+            BarColumn, MofNCompleteColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn,
+        )
+    except ImportError:  # pragma: no cover - rich ships with typer
+        return sync_envs(target, db_path, environment)
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[bold blue]{task.description}"),
+        BarColumn(bar_width=None),
+        MofNCompleteColumn(),
+        TextColumn("•"),
+        TimeElapsedColumn(),
+        TextColumn("[dim]{task.fields[svc]}"),
+        transient=False,
+    ) as progress:
+        task = progress.add_task("Syncing envs", total=None, svc="discovering…")
+
+        def hook(done: int, total: int, svc: str) -> None:
+            progress.update(task, total=total, completed=done, svc=svc)
+
+        return sync_envs(target, db_path, environment, on_overlay=hook)
 
 
 def _index_with_progress(target: Path, db_path: Path, environment, docs_path: Optional[Path] = None):

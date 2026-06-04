@@ -347,6 +347,15 @@ def _resolve_service_edges(
                     continue
                 for key in secret.key_names:
                     _emit_heuristic(graph, node_id, result.overlay.service, env, key, secret.source_file)
+                # Also record the secret itself with ALL its env-var names + file
+                # location (never values), so keys without a datastore match aren't lost.
+                _emit_reference(
+                    graph, node_id, NodeType.SECRET, "secret",
+                    graph.nodes[node_id].namespace or "default", secret_name, env,
+                    secret.source_file,
+                    node_attrs={"keys": list(secret.key_names), "source_file": secret.source_file},
+                    signal=Signal.SECRET_KEY_NAME,
+                )
 
         # 4. volume-mounted config (per deployment, not per container)
         ns = graph.nodes[node_id].namespace or "default"
@@ -365,7 +374,15 @@ def _resolve_service_edges(
             else:  # plain config — record the dependency on the configmap
                 _emit_reference(graph, node_id, NodeType.CONFIGMAP, "cm", ns, cm_name, env, dep.resource.source_file)
         for secret_name in dep.secret_volumes:
-            _emit_reference(graph, node_id, NodeType.SECRET, "secret", ns, secret_name, env, dep.resource.source_file)
+            sv = secret_index.get(secret_name)
+            # Store ONLY the key names and the Secret's own file location — never values.
+            secret_attrs = (
+                {"keys": list(sv.key_names), "source_file": sv.source_file} if sv else None
+            )
+            _emit_reference(
+                graph, node_id, NodeType.SECRET, "secret", ns, secret_name, env,
+                dep.resource.source_file, node_attrs=secret_attrs,
+            )
 
     # 5. helmCharts -> explicit depends_on_chart (overlay-level -> primary node)
     for chart in result.helm_charts:
@@ -821,10 +838,17 @@ def _emit_reference(
     name: str,
     env: Environment,
     source_file: str,
+    node_attrs: dict | None = None,
+    signal: Signal = Signal.VOLUME_MOUNT,
 ) -> None:
-    """Record that a service mounts a ConfigMap/Secret as config (no values read)."""
+    """Record that a service mounts/consumes a ConfigMap/Secret as config (no values read).
+
+    ``node_attrs`` may carry the referenced object's own metadata — for a Secret
+    the key/env-var *names* and the file it is defined in — never any secret value.
+    ``signal`` distinguishes a volume mount from an ``envFrom`` reference.
+    """
     dst_id = f"{prefix}:{ns}/{name}"
-    graph.add_node(Node(id=dst_id, type=node_type, name=name, namespace=ns))
+    graph.add_node(Node(id=dst_id, type=node_type, name=name, namespace=ns, attrs=node_attrs or {}))
     graph.add_edge(
         Edge(
             src_id=src_id,
@@ -832,8 +856,12 @@ def _emit_reference(
             type=EdgeType.REFERENCES,
             environment=env,
             provenance=Provenance.EXPLICIT,
-            signal=Signal.VOLUME_MOUNT,
+            signal=signal,
             source_file=source_file,
+            # A stable, non-null locator keeps this edge's UNIQUE identity matchable
+            # on re-sync (SQLite treats NULL locators as always-distinct, which would
+            # otherwise churn the row every `sync-envs`).
+            source_locator=name,
         )
     )
 
