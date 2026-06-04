@@ -1,6 +1,6 @@
 [project]
 name = "kubedian"
-version = "1.0.1"
+version = "1.0.2"
 description = "A Kubernetes-native tool that reconstructs the service dependency graph from your Kubernetes/Kustomize manifests — who calls whom, datastores, queues and external APIs. Exposes it as a SQLite graph, a CLI, an MCP server for AI agents, Mermaid diagrams and Markdown docs, without decrypting secrets."
 # readme is dynamic: built from README.md with Mermaid blocks replaced for PyPI
 # (PyPI does not render Mermaid). See [tool.hatch.metadata.hooks.fancy-pypi-readme].
