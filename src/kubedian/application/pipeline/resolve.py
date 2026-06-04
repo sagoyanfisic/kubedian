@@ -849,6 +849,10 @@ def _emit_reference(
     """
     dst_id = f"{prefix}:{ns}/{name}"
     graph.add_node(Node(id=dst_id, type=node_type, name=name, namespace=ns, attrs=node_attrs or {}))
+    # The edge already carries the environment and the app (src_id), so putting the
+    # key NAMES here pins each variable to its (app, environment) — one edge per
+    # (app, secret, env), so it never merges across environments like the node does.
+    edge_attrs = {"keys": list(node_attrs["keys"])} if node_attrs and node_attrs.get("keys") else {}
     graph.add_edge(
         Edge(
             src_id=src_id,
@@ -862,6 +866,7 @@ def _emit_reference(
             # on re-sync (SQLite treats NULL locators as always-distinct, which would
             # otherwise churn the row every `sync-envs`).
             source_locator=name,
+            attrs=edge_attrs,
         )
     )
 
