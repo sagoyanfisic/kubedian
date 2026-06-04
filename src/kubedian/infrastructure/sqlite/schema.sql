@@ -3,11 +3,12 @@ PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS nodes (
-    id        TEXT PRIMARY KEY,
-    type      TEXT NOT NULL,
-    name      TEXT NOT NULL,
-    namespace TEXT,
-    attrs     TEXT NOT NULL DEFAULT '{}'
+    id         TEXT PRIMARY KEY,
+    type       TEXT NOT NULL,
+    name       TEXT NOT NULL,
+    namespace  TEXT,
+    attrs      TEXT NOT NULL DEFAULT '{}',
+    generation INTEGER NOT NULL DEFAULT 0  -- bumped by sync-envs for mark-and-sweep
 );
 
 CREATE TABLE IF NOT EXISTS edges (
@@ -22,6 +23,7 @@ CREATE TABLE IF NOT EXISTS edges (
     source_locator TEXT,
     confidence     REAL NOT NULL DEFAULT 1.0,
     attrs          TEXT NOT NULL DEFAULT '{}',
+    generation     INTEGER NOT NULL DEFAULT 0,  -- bumped by sync-envs for mark-and-sweep
     UNIQUE(src_id, dst_id, type, environment, source_locator)
 );
 
@@ -32,7 +34,8 @@ CREATE TABLE IF NOT EXISTS index_meta (
     kustomize_version TEXT,
     service_count     INTEGER,
     edge_count        INTEGER,
-    render_failures   INTEGER
+    render_failures   INTEGER,
+    generation        INTEGER NOT NULL DEFAULT 0  -- current mark-and-sweep generation
 );
 
 CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(src_id, environment);
