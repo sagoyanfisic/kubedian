@@ -25,6 +25,12 @@ _EDGE_KEY = {
     EdgeType.CALLS_EXTERNAL: "calls_external",
     EdgeType.DEPENDS_ON_CHART: "depends_on_chart",
     EdgeType.ROUTES_TO: "routes_to",
+    EdgeType.ALLOWS_TO: "allows_to",
+    EdgeType.SELECTS: "selects",
+    EdgeType.MOUNTS: "mounts",
+    EdgeType.SCALES: "scales",
+    EdgeType.RUNS_AS: "runs_as",
+    EdgeType.OWNS: "owns",
 }
 
 _DATASTORE_TYPES = {NodeType.DATABASE, NodeType.CACHE, NodeType.QUEUE}

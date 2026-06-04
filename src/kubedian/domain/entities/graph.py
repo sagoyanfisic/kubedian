@@ -25,6 +25,11 @@ class NodeType(StrEnum):
     INGRESS_HOST = "ingress_host"
     HELM_CHART = "helm_chart"
     GATEWAY = "gateway"
+    STORAGE = "storage"  # PersistentVolumeClaim
+    AUTOSCALER = "autoscaler"  # HorizontalPodAutoscaler
+    SERVICE_ACCOUNT = "service_account"
+    JOB = "job"  # one-off batch workload
+    CRONJOB = "cronjob"  # scheduled batch workload
 
 
 class EdgeType(StrEnum):
@@ -36,10 +41,17 @@ class EdgeType(StrEnum):
     AUTHENTICATES_VIA = "authenticates_via"
     CALLS_EXTERNAL = "calls_external"
     ROUTES_TO = "routes_to"
+    # Connectivity *permitted* by a NetworkPolicy — declarative but weaker than a
+    # call: "X is allowed to reach Y", never "X calls Y". Kept on its own type so
+    # consumers never mistake a permission for an observed dependency.
+    ALLOWS_TO = "allows_to"
     DEPENDS_ON_CHART = "depends_on_chart"
     REFERENCES = "references"
     OWNS = "owns"
     SELECTS = "selects"
+    MOUNTS = "mounts"  # workload -> PersistentVolumeClaim
+    SCALES = "scales"  # HorizontalPodAutoscaler -> workload
+    RUNS_AS = "runs_as"  # workload -> ServiceAccount
     IN_NAMESPACE = "in_namespace"
 
 
@@ -59,6 +71,11 @@ class Signal(StrEnum):
     HELMCHART = "helmchart"
     ISTIO_VS = "istio_vs"
     INGRESS_BACKEND = "ingress_backend"
+    NETWORK_POLICY = "network_policy"
+    VOLUME_CLAIM = "volume_claim"
+    HPA_TARGET = "hpa_target"
+    SERVICE_ACCOUNT_REF = "service_account_ref"
+    GATEWAY_BINDING = "gateway_binding"
     AUTH_ANNOTATION = "auth_annotation"
     OWNER_REF = "owner_ref"
     SELECTOR = "selector"

@@ -12,10 +12,12 @@ exposes.
 ## What it's for
 
 Kubedian builds a queryable **dependency graph between your services**: who calls whom over
-HTTP, which database / cache / queue each one uses, and which external APIs it depends on.
-It extracts all of this **directly from the YAML you already have** — Kustomize overlays,
-Deployment env vars, shared ConfigMaps, Helm charts, Istio/Ingress routing — and exposes it
-as a SQLite graph, a CLI, an MCP server for AI agents, Mermaid diagrams, and Markdown docs.
+HTTP, which database / cache / queue each one uses, which external APIs it depends on, and the
+structural infra around each workload — Istio/Ingress routing, PVCs it mounts, the HPA that
+scales it, its ServiceAccount, NetworkPolicy connectivity. It extracts all of this **directly
+from the YAML you already have** — Kustomize overlays, Deployment env vars, shared ConfigMaps,
+generators, Helm charts — and exposes it as a SQLite graph, a CLI, an MCP server for AI agents,
+Mermaid diagrams, and Markdown docs.
 
 ## The problem it solves
 
@@ -43,8 +45,32 @@ pip install kubedian                 # core: index + graph + diagrams + docs
 pip install "kubedian[mcp]"          # + MCP server
 ```
 
-Requires the external [`kustomize`](https://kustomize.io) binary on `PATH` for accurate
-rendering; Kubedian falls back to raw-YAML parsing if it's missing.
+### Requirement: `kustomize`
+
+Kubedian shells out to the external [`kustomize`](https://kustomize.io) binary to render each
+overlay accurately — the namespace transformer, patches, name prefixes/suffixes and generators.
+Install it and make sure it's on your `PATH`:
+
+```bash
+# macOS
+brew install kustomize
+
+# Linux (official installer → ./kustomize, then move it onto your PATH)
+curl -s "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash
+sudo mv kustomize /usr/local/bin/
+
+# Windows (any of these)
+choco install kustomize          # Chocolatey
+scoop install kustomize          # Scoop
+winget install Kubernetes.kustomize
+
+kustomize version                # verify it's on PATH
+```
+
+If `kustomize` is missing — or an overlay can't build (e.g. a SOPS/ksops generator) — Kubedian
+**never fails**: it falls back to parsing the raw YAML, records the `render_mode`, and reports how
+many overlays fell back in `kubedian status` (`render_failures`). The fallback still produces a
+graph, just with lower fidelity (patches and name prefixes aren't applied).
 
 ## Usage
 
@@ -54,7 +80,7 @@ kubedian index --env production
 
 # 2. Query the topology
 kubedian status
-kubedian context  orders-service        # who calls it, what it calls, datastores, externals
+kubedian context  orders-service        # callers, callees, datastores, externals, routing, storage, identity, autoscaling
 kubedian callers   catalog-service      # incoming dependencies
 kubedian callees   orders-service        # outgoing dependencies
 kubedian trace     checkout-service orders-service
@@ -79,16 +105,15 @@ specific environment (development | staging | production | test).
 
 ```console
 $ kubedian callers catalog-service --env production
- - checkout-service   (explicit, service-discovery.CATALOG_API_URL)
- - orders-service     (explicit, service-discovery.CATALOG_API_URL)
- - pricing-service    (explicit, service-discovery.CATALOG_API_URL)
- - promo-service      (explicit, service-discovery.CATALOG_API_URL)
- - inventory-service  (explicit, service-discovery.CATALOG_API_URL)
- - delivery-service   (explicit, service-discovery.CATALOG_API_URL)
- - auth-service       (explicit, service-discovery.CATALOG_API_URL)
- - web-frontend       (explicit, service-discovery.CATALOG_API_URL)
- - erp-connector      (explicit, service-discovery.CATALOG_API_URL)
+ - checkout-service   (heuristic, shared_catalog: service-discovery.CATALOG_API_URL)
+ - orders-service     (heuristic, shared_catalog: service-discovery.CATALOG_API_URL)
+ - pricing-service    (heuristic, shared_catalog: service-discovery.CATALOG_API_URL)
+ - web-frontend       (explicit,  web-frontend env CATALOG_URL=http://catalog-service…)
 ```
+
+> When many services mount the *same* discovery ConfigMap, having a URL available isn't
+> proof of a call, so those edges are honestly marked `heuristic` (`shared_catalog`). A
+> caller whose own config names the URL directly stays `explicit`.
 
 **What does a service talk to?**
 
@@ -109,10 +134,13 @@ It never runs the cluster — it reconstructs each edge from a concrete signal i
 
 | Signal in the YAML | Becomes the edge | Provenance |
 |--------------------|------------------|------------|
-| A service-discovery **ConfigMap** entry — `CATALOG_API_URL: http://catalog-service.catalog.svc.cluster.local` consumed via `envFrom` | `checkout-service → catalog-service` (`http_calls`) | `explicit` |
+| A service-discovery **ConfigMap**/`configMapGenerator` entry — `CATALOG_API_URL: http://catalog-service.catalog.svc.cluster.local` consumed via `envFrom` | `checkout-service → catalog-service` (`http_calls`) | `explicit` (or `heuristic` if it's a *shared catalog*) |
 | A literal **env var** whose value is an in-cluster DNS name (`*.svc.cluster.local`) | caller → that service (`http_calls`) | `explicit` |
+| An **Istio VirtualService / Ingress / Gateway** routing to a backend | gateway / ingress-host → service (`routes_to`) | `explicit` |
+| A **NetworkPolicy** egress/ingress allowing a peer (by selector) | source → peer (`allows_to` — *permitted*, not observed) | `explicit` |
 | A **secret key name** like `POSTGRES_HOST` / `RABBITMQ_HOST` / `REDIS_URL` (value stays encrypted) | service → its database / queue / cache | `heuristic` |
 | A `*_URL` key pointing at a non-cluster host (e.g. `EMAIL_API_URL`) | service → external API | `heuristic` |
+| A workload's `volumeClaimTemplates` / mounted **PVC**, its **HPA** `scaleTargetRef`, its `serviceAccountName` | `mounts` → storage · `scales` (HPA→workload) · `runs_as` → ServiceAccount | `explicit` |
 | A **Mermaid diagram** in your `docs/` drawing `A --> B` | `A → B` | `documented` |
 | A `helmCharts[]` entry / a mounted ConfigMap or Secret | `depends_on_chart` / `references` | `explicit` |
 
@@ -196,8 +224,8 @@ cluster and no secret is ever decrypted:
 |-------|--------------|
 | **discover** | Walks the repo and finds every renderable unit — the Kustomize overlays per service and environment. |
 | **render** | Runs `kustomize build` on each overlay to get the real resolved objects (namespace transformer, patches, name prefixes). Falls back to raw-YAML parsing if an overlay won't build (e.g. a SOPS/ksops generator), so one broken service never aborts the index. |
-| **extract** | Parses the rendered Kubernetes objects into typed views: Deployments and their env / `envFrom`, Services, ConfigMaps, Secrets (key names only), Helm chart refs, volume mounts, Istio/Ingress routing. |
-| **resolve** | Turns resources into a graph: resolves in-cluster DNS (`*.svc.cluster.local`), the service-discovery ConfigMap URLs, secret-key heuristics (`POSTGRES_HOST` → a database), Helm dependencies and config mounts — each as an edge with provenance. |
+| **extract** | Parses the rendered objects into typed views: each workload (Deployment / StatefulSet / DaemonSet / Job / CronJob) with its env / `envFrom` / ports / `serviceAccountName` / PVCs, plus Services, ConfigMaps, Secrets (key names only), `configMapGenerator`/`secretGenerator`, Helm refs, and Istio/Ingress/NetworkPolicy/HPA/PVC/ServiceAccount objects. |
+| **resolve** | Builds the graph with **one node per workload** (a bundle of api + worker + beat + flower becomes a node each; Jobs/CronJobs get their own type). Resolves in-cluster DNS, discovery-ConfigMap URLs (shared catalogs downgraded to `heuristic`), secret-key heuristics, Istio/Ingress/Gateway routing, NetworkPolicy connectivity, PVC mounts, HPA scaling, ServiceAccount identity and Helm deps — each an edge with provenance. The workload **name** is the authoritative alias, so a shared `app` label can't misroute an edge. |
 | **ingest** *(optional, `--docs`)* | Parses Mermaid diagrams in your `docs/` and adds the edges they assert. |
 | **store** | Writes nodes and edges to a local **SQLite** graph — the single source of truth. |
 | **serve / export** | The CLI and the MCP server read the graph; exporters render it to Mermaid diagrams or Markdown docs. |

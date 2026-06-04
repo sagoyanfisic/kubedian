@@ -19,6 +19,12 @@ _TAG = {
     NodeType.EXTERNAL_API: "external",
     NodeType.HELM_CHART: "chart",
     NodeType.NAMESPACE: "namespace",
+    NodeType.GATEWAY: "gateway",
+    NodeType.STORAGE: "storage",
+    NodeType.AUTOSCALER: "autoscaler",
+    NodeType.SERVICE_ACCOUNT: "serviceaccount",
+    NodeType.JOB: "job",
+    NodeType.CRONJOB: "cronjob",
 }
 
 _EDGE_FIELD = {
@@ -31,6 +37,12 @@ _EDGE_FIELD = {
     EdgeType.CALLS_EXTERNAL: "Calls external",
     EdgeType.DEPENDS_ON_CHART: "Depends on chart",
     EdgeType.ROUTES_TO: "Routes to",
+    EdgeType.ALLOWS_TO: "Allowed to reach",
+    EdgeType.SELECTS: "Selects",
+    EdgeType.MOUNTS: "Mounts",
+    EdgeType.SCALES: "Scales",
+    EdgeType.RUNS_AS: "Runs as",
+    EdgeType.OWNS: "Owns",
     EdgeType.REFERENCES: "Mounts config",
 }
 

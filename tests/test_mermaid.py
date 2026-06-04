@@ -40,3 +40,17 @@ def test_labels_are_translated(tmp_path):
 def test_no_inline_namespace_edges(tmp_path):
     out = mermaid_renderer.render_flowchart(_graph(tmp_path), lang="en")
     assert "in namespace" not in out
+
+
+def test_include_isolated_draws_edgeless_nodes():
+    from kubedian.domain.entities.graph import Graph, Node, NodeType
+
+    g = Graph()
+    g.add_node(Node(id="svc:ns/lonely", type=NodeType.CRONJOB, name="lonely", namespace="ns"))
+    g.add_node(Node(id="svc:ns/a", type=NodeType.SERVICE, name="a", namespace="ns"))
+    # default: an edge-less node is dropped
+    assert "lonely" not in mermaid_renderer.render_flowchart(g, lang="en")
+    # include_isolated: it is drawn, with its cronjob class
+    iso = mermaid_renderer.render_flowchart(g, lang="en", include_isolated=True)
+    assert "lonely" in iso
+    assert ":::cronjob" in iso

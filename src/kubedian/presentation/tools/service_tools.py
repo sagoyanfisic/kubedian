@@ -19,9 +19,11 @@ def register_service_tools(mcp) -> None:
 
     @mcp.tool(annotations=_RO)
     def service_context(service: str, environment: Optional[str] = "production") -> dict:
-        """PRIMARY tool: full context for a service in ONE call — its identity,
-        who calls it, what it calls, its datastores and external dependencies.
-        Every edge cites provenance (explicit vs heuristic) and source file."""
+        """PRIMARY tool: full context for a service in ONE call — its identity
+        (workload kind, replicas, ports, service account), who calls it, what it
+        calls, its datastores, external dependencies, routing (Istio/Ingress),
+        storage (PVCs), identity (ServiceAccount) and autoscaling (HPA). Every edge
+        cites provenance (explicit vs heuristic) and source file."""
         return queries.context(get_reader(), service, parse_env(environment))
 
     @mcp.tool(annotations=_RO)
@@ -31,12 +33,14 @@ def register_service_tools(mcp) -> None:
 
     @mcp.tool(annotations=_RO)
     def service_callees(service: str, environment: Optional[str] = "production", limit: int = 100) -> dict:
-        """What this service depends on (services, db, cache, queue, external)."""
+        """What this service depends on (services, db, cache, queue, external,
+        storage/PVC, service account, routing targets)."""
         return queries.callees(get_reader(), service, parse_env(environment), limit)
 
     @mcp.tool(annotations=_RO)
     def service_trace(source: str, target: str, environment: Optional[str] = "production", max_depth: int = 6) -> dict:
-        """Find a request path between two services (transitive http_calls)."""
+        """Find a request path between two services, following http_calls and
+        Istio/Ingress routes_to (so paths through a gateway are traced too)."""
         return queries.trace(get_reader(), source, target, parse_env(environment), max_depth)
 
     @mcp.tool(annotations=_RO)

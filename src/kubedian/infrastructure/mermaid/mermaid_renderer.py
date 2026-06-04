@@ -19,6 +19,12 @@ _CLASSDEF = {
     NodeType.HELM_CHART: "classDef helm_chart fill:#e0f2fe,stroke:#0284c7,color:#075985;",
     NodeType.CONFIGMAP: "classDef configmap fill:#f1f5f9,stroke:#64748b,color:#334155;",
     NodeType.SECRET: "classDef secret fill:#f1f5f9,stroke:#64748b,color:#334155;",
+    NodeType.GATEWAY: "classDef gateway fill:#ede9fe,stroke:#7c3aed,color:#4c1d95;",
+    NodeType.STORAGE: "classDef storage fill:#fef3c7,stroke:#d97706,color:#78350f;",
+    NodeType.AUTOSCALER: "classDef autoscaler fill:#cffafe,stroke:#0891b2,color:#164e63;",
+    NodeType.SERVICE_ACCOUNT: "classDef service_account fill:#f1f5f9,stroke:#64748b,color:#334155;",
+    NodeType.JOB: "classDef job fill:#ecfccb,stroke:#65a30d,color:#365314;",
+    NodeType.CRONJOB: "classDef cronjob fill:#ecfccb,stroke:#4d7c0f,color:#1a2e05;",
 }
 
 # Mermaid node shapes per type: service in rounded box, datastores in cylinders.
@@ -32,6 +38,12 @@ _SHAPE = {
     NodeType.NAMESPACE: ("[", "]"),
     NodeType.CONFIGMAP: ("[\\", "\\]"),
     NodeType.SECRET: ("[\\", "\\]"),
+    NodeType.GATEWAY: ("{{", "}}"),
+    NodeType.STORAGE: ("[(", ")]"),
+    NodeType.AUTOSCALER: ("([", "])"),
+    NodeType.SERVICE_ACCOUNT: ("[/", "/]"),
+    NodeType.JOB: ("[[", "]]"),
+    NodeType.CRONJOB: ("[[", "]]"),
 }
 
 _EDGE_LABEL_KEY = {
@@ -43,6 +55,12 @@ _EDGE_LABEL_KEY = {
     EdgeType.AUTHENTICATES_VIA: "authenticates_via",
     EdgeType.CALLS_EXTERNAL: "calls_external",
     EdgeType.ROUTES_TO: "routes_to",
+    EdgeType.ALLOWS_TO: "allows_to",
+    EdgeType.SELECTS: "selects",
+    EdgeType.MOUNTS: "mounts",
+    EdgeType.SCALES: "scales",
+    EdgeType.RUNS_AS: "runs_as",
+    EdgeType.OWNS: "owns",
     EdgeType.DEPENDS_ON_CHART: "depends_on_chart",
     EdgeType.REFERENCES: "references",
 }
@@ -52,16 +70,25 @@ _HIDDEN_EDGES = {EdgeType.IN_NAMESPACE}
 
 
 def render_flowchart(
-    graph: Graph, *, lang: str = "en", group_by_namespace: bool = True, include_references: bool = False
+    graph: Graph,
+    *,
+    lang: str = "en",
+    group_by_namespace: bool = True,
+    include_references: bool = False,
+    include_isolated: bool = False,
 ) -> str:
     """Render a flowchart of the graph. ``in_namespace`` edges are not drawn —
     namespaces become ``subgraph`` containers instead. ``references`` (config
-    mounts) are hidden in the topology view unless ``include_references``."""
+    mounts) are hidden unless ``include_references``. By default only nodes touched
+    by a drawn edge appear; ``include_isolated`` also draws edge-less nodes (e.g. a
+    CronJob that declares no dependencies), so they aren't silently dropped."""
     hidden = set(_HIDDEN_EDGES)
     if not include_references:
         hidden.add(EdgeType.REFERENCES)
     edges = [e for e in graph.edges if e.type not in hidden]
     used_ids = {e.src_id for e in edges} | {e.dst_id for e in edges}
+    if include_isolated:
+        used_ids |= {nid for nid, n in graph.nodes.items() if n.type != NodeType.NAMESPACE}
     nodes = {nid: graph.nodes[nid] for nid in used_ids if nid in graph.nodes}
 
     lines: list[str] = ["flowchart LR"]

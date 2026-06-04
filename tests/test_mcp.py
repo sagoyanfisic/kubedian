@@ -18,10 +18,35 @@ def indexed_db(tmp_path, monkeypatch):
     index_repo(repo, db, Environment.STAGING)
     monkeypatch.setenv("KUBEDIAN_DB", str(db))
     # reset the cached reader so it picks up this DB
-    from kubedian.presentation.tools.dependencies import get_reader
+    from kubedian.presentation.tools.dependencies import reset_reader
 
-    get_reader.cache_clear()
+    reset_reader()
     return db
+
+
+def test_reader_reloads_when_db_mtime_changes(tmp_path, monkeypatch):
+    """The MCP caches the reader, but a reindex (which bumps the DB's mtime) must be
+    picked up on the next query without restarting the server."""
+    import os
+    import time
+
+    from kubedian.presentation.tools.dependencies import get_reader, reset_reader
+
+    repo = write_sample_repo(tmp_path)
+    db = tmp_path / "graph.db"
+    index_repo(repo, db, Environment.STAGING)
+    monkeypatch.setenv("KUBEDIAN_DB", str(db))
+    reset_reader()
+
+    first = get_reader()
+    assert get_reader() is first  # unchanged DB → same cached reader
+
+    # simulate a reindex touching the file (advance mtime)
+    future = time.time() + 5
+    os.utime(db, (future, future))
+
+    assert get_reader() is not first  # mtime changed → reader transparently reopened
+    reset_reader()
 
 
 async def test_mcp_tools_registered_and_context(indexed_db):
