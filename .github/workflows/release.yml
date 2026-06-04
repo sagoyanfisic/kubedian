@@ -1,36 +1,70 @@
 name: Release
 
-# Publishes to PyPI via Trusted Publishing (OIDC) on a version tag.
-# Configure the PyPI project's trusted publisher to this repo + workflow first.
+# Single flow: when pyproject.toml's version changes on master, build, test,
+# publish to PyPI, then tag v<version>. The tag is just a marker/guard so the
+# same version is never published twice — it triggers nothing, so the default
+# GITHUB_TOKEN (with contents:write) can push it; no PAT needed.
+#
+# Setup once: add a repo secret PYPI_API_TOKEN
+# (GitHub -> Settings -> Secrets and variables -> Actions -> New repository secret).
 on:
   push:
-    tags: ["v*"]
+    branches: [master]
+    paths: ["pyproject.toml"]
+  workflow_dispatch:
 
 jobs:
-  build:
+  check:
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      released: ${{ steps.check.outputs.released }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # need existing tags to dedup
+      - name: Read version from pyproject.toml
+        id: ver
+        run: |
+          VERSION=$(grep -E '^version *= *"' pyproject.toml | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+          if [ -z "$VERSION" ]; then
+            echo "Could not read version from pyproject.toml" >&2
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      - name: Has this version already been released?
+        id: check
+        run: |
+          if git rev-parse "v${{ steps.ver.outputs.version }}" >/dev/null 2>&1; then
+            echo "released=true" >> "$GITHUB_OUTPUT"
+            echo "v${{ steps.ver.outputs.version }} already tagged — nothing to do."
+          else
+            echo "released=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  release:
+    needs: check
+    if: needs.check.outputs.released == 'false'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write           # to push the release tag with GITHUB_TOKEN
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: astral-sh/setup-uv@v5
       - run: uv python install 3.12
       - run: uv sync --extra mcp
       - run: uv run pytest -q
       - run: uv build
-      - uses: actions/upload-artifact@v4
-        with:
-          name: dist
-          path: dist/
-
-  publish:
-    needs: build
-    runs-on: ubuntu-latest
-    environment: pypi
-    permissions:
-      id-token: write  # required for Trusted Publishing (OIDC)
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: dist
-          path: dist/
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}
+      - name: Tag the release
+        run: |
+          TAG="v${{ needs.check.outputs.version }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "Release $TAG"
+          git push origin "$TAG"
