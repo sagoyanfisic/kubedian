@@ -529,3 +529,104 @@ def test_nodepool_from_node_selector_and_affinity(tmp_path):
     assert graph.nodes["svc:pool/worker"].attrs["nodepool"] == "gpu"
     # a workload that pins no pool has nodepool=None (not surfaced by node_dict)
     assert graph.nodes["svc:pool/free"].attrs["nodepool"] is None
+
+
+# --------------------------------------------------------------------------- #
+# valueFrom key refs, consumption modes, ports
+# --------------------------------------------------------------------------- #
+def _references(graph, src_id, dst_id):
+    return [
+        e for e in graph.edges
+        if e.type == EdgeType.REFERENCES and e.src_id == src_id and e.dst_id == dst_id
+    ]
+
+
+def test_valuefrom_secret_key_ref_merges_with_envfrom(tmp_path):
+    """service-a consumes service-a-secret BOTH via envFrom and via a single
+    valueFrom secretKeyRef (DATABASE_HOST <- POSTGRES_HOST). One REFERENCES edge
+    must survive, carrying the union of modes, all key names and the var->key map."""
+    graph = _graph_for(write_sample_repo(tmp_path))
+    refs = _references(graph, "svc:ns-a/service-a", "secret:ns-a/service-a-secret")
+    assert len(refs) == 1, [(e.signal, e.attrs) for e in refs]
+    edge = refs[0]
+    assert set(edge.attrs["modes"]) == {Signal.ENV_FROM.value, Signal.ENV_KEY_REF.value}
+    assert edge.attrs["env_map"] == {"DATABASE_HOST": "POSTGRES_HOST"}
+    assert "POSTGRES_HOST" in edge.attrs["keys"]
+    assert "REDIS_URI" in edge.attrs["keys"]  # from the envFrom full key set
+
+
+def test_valuefrom_configmap_key_ref_edge(tmp_path):
+    graph = _graph_for(write_sample_repo(tmp_path))
+    refs = _references(graph, "svc:ns-a/service-a", "cm:ns-a/service-a-config")
+    assert len(refs) == 1
+    edge = refs[0]
+    assert edge.attrs["modes"] == [Signal.ENV_KEY_REF.value]
+    assert edge.attrs["env_map"] == {"FEATURE_FLAG": "feature_flag"}
+    assert edge.attrs["keys"] == ["feature_flag"]
+
+
+def test_envfrom_configmap_emits_reference(tmp_path):
+    """envFrom configMapRef now records the configmap dependency itself, even for
+    a discovery configmap (the http_calls edges remain separate)."""
+    graph = _graph_for(write_sample_repo(tmp_path))
+    refs = _references(graph, "svc:ns-a/service-a", "cm:ns-a/service-discovery")
+    assert len(refs) == 1
+    assert Signal.ENV_FROM.value in refs[0].attrs["modes"]
+
+
+def test_valuefrom_var_name_feeds_heuristics(tmp_path):
+    """The env var NAME of a valueFrom ref (DATABASE_HOST) must drive the same
+    key-name heuristics as envFrom keys; it dedups into the postgres edge."""
+    graph = _graph_for(write_sample_repo(tmp_path))
+    reads = [
+        e for e in graph.edges
+        if e.src_id == "svc:ns-a/service-a" and e.type == EdgeType.READS_FROM
+    ]
+    assert len(reads) == 1
+    locators = reads[0].attrs.get("locators") or [reads[0].source_locator]
+    assert "DATABASE_HOST" in locators or reads[0].source_locator == "DATABASE_HOST"
+    assert "POSTGRES_HOST" in locators or "DATABASE_HOST" in locators
+
+
+def test_workload_env_var_names_only(tmp_path):
+    graph = _graph_for(write_sample_repo(tmp_path))
+    attrs = graph.nodes["svc:ns-a/service-a"].attrs
+    assert attrs["env_vars"] == ["DATABASE_HOST", "FEATURE_FLAG"]
+
+
+def test_service_port_map_resolves_named_target_port(tmp_path):
+    """service-b's Service declares port 80 -> targetPort 'http'; the named port
+    must resolve to the workload's containerPort 8080."""
+    graph = _graph_for(write_sample_repo(tmp_path))
+    node = graph.nodes["svc:ns-b/service-b"]
+    assert node.attrs["ports"] == [8080]
+    # both the service-b Service and the edge-proxy Service front this workload;
+    # each contributes its own (tagged) wiring.
+    assert {
+        "name": "http", "port": 80, "target_port": 8080, "protocol": "TCP",
+        "service": "service-b",
+    } in node.attrs["port_map"]
+    assert any(p["service"] == "edge-proxy" for p in node.attrs["port_map"])
+
+
+def test_ingress_route_carries_backend_port(tmp_path):
+    graph = _graph_for(write_sample_repo(tmp_path))
+    edges = [
+        e for e in graph.edges
+        if e.type == EdgeType.ROUTES_TO and e.signal == Signal.INGRESS_BACKEND
+        and e.src_id == "ingress-host:gw.example.com"
+    ]
+    assert edges and edges[0].attrs.get("port") == 80
+
+
+def test_virtualservice_route_carries_destination_port(tmp_path):
+    graph = _graph_for(write_sample_repo(tmp_path))
+    vs_edges = [
+        e for e in graph.edges
+        if e.type == EdgeType.ROUTES_TO
+        and e.signal in (Signal.ISTIO_VS, Signal.GATEWAY_BINDING)
+        and e.dst_id == "svc:ns-b/service-b"
+    ]
+    assert vs_edges
+    for e in vs_edges:
+        assert e.attrs.get("port") == 8080, (e.signal, e.attrs)

@@ -73,3 +73,33 @@ async def test_mcp_diagram_tool(indexed_db):
         res = await client.call_tool("service_diagram", {"scope": "all", "lang": "es"})
         assert res.data["format"] == "mermaid"
         assert "flowchart" in res.data["diagram"]
+
+
+async def test_mcp_config_tools(indexed_db):
+    from kubedian.main import mcp
+
+    async with Client(mcp) as client:
+        names = {t.name for t in await client.list_tools()}
+        assert {"service_secrets", "service_ports", "find_key_usage", "find_port"} <= names
+
+        res = await client.call_tool(
+            "service_secrets", {"service": "service-a", "environment": "staging"}
+        )
+        secrets = {s["name"]: s for s in res.data["secrets"]}
+        assert "POSTGRES_HOST" in secrets["service-a-secret"]["keys"]
+        assert "ENC[" not in str(res.data)  # never values, only key names
+
+        res = await client.call_tool(
+            "service_ports", {"service": "service-b", "environment": "staging"}
+        )
+        assert res.data["container_ports"] == [8080]
+        assert any(p["port"] == 80 and p["target_port"] == 8080 for p in res.data["service_ports"])
+
+        res = await client.call_tool("find_key_usage", {"query": "POSTGRES_HOST"})
+        assert any(
+            m["workload"] == "service-a" and m["ref"] == "service-a-secret"
+            for m in res.data["matches"]
+        )
+
+        res = await client.call_tool("find_port", {"port": 8080})
+        assert any(n["name"] == "service-b" for n in res.data["listeners"])

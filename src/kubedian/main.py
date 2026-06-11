@@ -10,6 +10,7 @@ import os
 
 from fastmcp import FastMCP
 
+from kubedian.presentation.tools.config_tools import register_config_tools
 from kubedian.presentation.tools.datastore_tools import register_datastore_tools
 from kubedian.presentation.tools.namespace_tools import register_namespace_tools
 from kubedian.presentation.tools.service_tools import register_service_tools
@@ -25,13 +26,18 @@ INSTRUCTIONS = (
     "for an overview of one service. Every edge carries provenance: 'explicit' (the "
     "ConfigMap/manifest states it) or 'heuristic' (inferred from a secret key name such as "
     "POSTGRES_HOST) with a confidence score — never present a heuristic edge as a hard fact; "
-    "cite the source_file/source_locator. Most tools take an `environment` "
+    "cite the source_file/source_locator. Config questions are first-class too: "
+    "`service_secrets` (which Secrets/ConfigMaps a service consumes — key NAMES only, "
+    "values are never stored), `service_ports` (containerPorts, Service port->targetPort, "
+    "Ingress/VirtualService exposure), and reverse lookups `find_key_usage` (who uses env "
+    "var/key X) and `find_port` (who listens on port N). Most tools take an `environment` "
     "(development|staging|production|test, default production)."
 )
 
 mcp = FastMCP(name="Kubedian", instructions=INSTRUCTIONS)
 
 register_service_tools(mcp)
+register_config_tools(mcp)
 register_datastore_tools(mcp)
 register_namespace_tools(mcp)
 register_status_tools(mcp)

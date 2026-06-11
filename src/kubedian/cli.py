@@ -380,6 +380,63 @@ def impact(
     reader.close()
 
 
+@app.command()
+def secrets(
+    service: str = typer.Argument(..., help="Service name or node id."),
+    env: Optional[str] = typer.Option(None, "--env", "-e"),
+    db: Optional[Path] = typer.Option(None, "--db"),
+    repo: Optional[Path] = typer.Option(None, "--repo", "-r"),
+    json: bool = typer.Option(False, "--json"),
+) -> None:
+    """Secrets and ConfigMaps a service consumes — key NAMES only (never values), with consumption mode and var→key mapping."""
+    reader = _open_reader(db, repo)
+    _emit(queries.service_secrets(reader, service, _parse_env(env)), json)
+    reader.close()
+
+
+@app.command()
+def ports(
+    service: str = typer.Argument(..., help="Service name or node id."),
+    env: Optional[str] = typer.Option(None, "--env", "-e"),
+    db: Optional[Path] = typer.Option(None, "--db"),
+    repo: Optional[Path] = typer.Option(None, "--repo", "-r"),
+    json: bool = typer.Option(False, "--json"),
+) -> None:
+    """Every port fact for a service: containerPorts, the Service's port→targetPort wiring, and Ingress/VirtualService exposure."""
+    reader = _open_reader(db, repo)
+    _emit(queries.service_ports(reader, service, _parse_env(env)), json)
+    reader.close()
+
+
+@app.command(name="find-key")
+def find_key_cmd(
+    query: str = typer.Argument(..., help="Env var or secret/configmap key name (e.g. POSTGRES_HOST)."),
+    partial: bool = typer.Option(False, "--partial", help="Substring match instead of exact (case-insensitive either way)."),
+    env: Optional[str] = typer.Option(None, "--env", "-e"),
+    db: Optional[Path] = typer.Option(None, "--db"),
+    repo: Optional[Path] = typer.Option(None, "--repo", "-r"),
+    json: bool = typer.Option(False, "--json"),
+) -> None:
+    """Reverse lookup: which workloads use an env var / secret key NAME, from which Secret/ConfigMap (names only, never values)."""
+    reader = _open_reader(db, repo)
+    _emit(queries.find_key_usage(reader, query, _parse_env(env), partial=partial), json)
+    reader.close()
+
+
+@app.command(name="find-port")
+def find_port_cmd(
+    port: int = typer.Argument(..., help="Port number (e.g. 8000)."),
+    env: Optional[str] = typer.Option(None, "--env", "-e"),
+    db: Optional[Path] = typer.Option(None, "--db"),
+    repo: Optional[Path] = typer.Option(None, "--repo", "-r"),
+    json: bool = typer.Option(False, "--json"),
+) -> None:
+    """Reverse lookup: which services listen on a port and which Ingress/VirtualService routes target it."""
+    reader = _open_reader(db, repo)
+    _emit(queries.find_port(reader, port, _parse_env(env)), json)
+    reader.close()
+
+
 @app.command(name="datastore-clients")
 def datastore_clients_cmd(
     datastore: str = typer.Argument(..., help="Datastore node id or name."),

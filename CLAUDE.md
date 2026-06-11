@@ -35,6 +35,14 @@ Edge types: `http_calls`, `routes_to` (Istio VirtualService / Ingress / Gateway)
 `depends_on_chart`, `references`, `owns`, `in_namespace`. `trace` follows `http_calls`
 **and** `routes_to` (so paths through a gateway are traced).
 
+**Config is queryable.** A `references` edge records *how* a Secret/ConfigMap is
+consumed in `attrs`: `modes` (`env_from` / `env_key_ref` / `volume_mount`), `keys`
+(the key names consumed) and `env_map` (env var → key for `valueFrom` wiring) —
+names only, never values. Workload nodes carry `ports`/`named_ports`/`env_vars`;
+their `port_map` lists each fronting Service's `port → target_port` wiring (named
+targetPorts resolved); `routes_to` edges carry the Ingress/VirtualService destination
+`port`. Reverse lookups: `find_key_usage` (who uses env var/key X) and `find_port`.
+
 ## Architecture (read-only pipeline, mirrors codegraph's stages)
 
 `discover` overlays → `render` (kustomize, raw-YAML fallback) → `extract` typed
@@ -80,6 +88,10 @@ Source of truth is **SQLite** (`.kubedian/graph.db`). Every other surface reads 
 uv sync --extra mcp
 uv run pytest -q
 uv run kubedian index --repo <repo> --env staging
+uv run kubedian secrets <svc> --json           # Secrets/ConfigMaps + key names + modes (never values)
+uv run kubedian ports <svc> --json             # containerPorts + Service port→targetPort + Ingress/VS exposure
+uv run kubedian find-key POSTGRES_HOST --json  # reverse lookup by env var / key name (--partial for substring)
+uv run kubedian find-port 8000 --json          # reverse lookup by port
 uv run kubedian export-vault --db .kubedian/graph.db --out ./vault
 uv run kubedian export-mermaid --db .kubedian/graph.db --focus <svc> --lang es
 uv run kubedian export-mermaid --db .kubedian/graph.db --include-isolated  # draw edge-less nodes too

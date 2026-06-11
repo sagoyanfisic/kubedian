@@ -128,3 +128,39 @@ def test_sync_envs_requires_existing_index(tmp_path):
         assert "kubedian index" in str(exc)
     else:  # pragma: no cover
         raise AssertionError("expected FileNotFoundError when no index exists")
+
+
+def _service_a_secret_edge_attrs(db: Path) -> dict:
+    conn = sqlite3.connect(str(db))
+    try:
+        row = conn.execute(
+            "SELECT attrs FROM edges WHERE src_id = 'svc:ns-a/service-a' "
+            "AND dst_id = ? AND type = 'references'",
+            (_SECRET_ID,),
+        ).fetchone()
+    finally:
+        conn.close()
+    return json.loads(row[0]) if row else {}
+
+
+def test_sync_envs_sweeps_valuefrom_env_map(tmp_path):
+    """Removing the valueFrom block from the deployment must drop the var->key
+    mapping (and the env_key_ref mode) from the REFERENCES edge on sync."""
+    repo = write_sample_repo(tmp_path)
+    db = tmp_path / "graph.db"
+    index_repo(repo, db, Environment.STAGING)
+
+    attrs = _service_a_secret_edge_attrs(db)
+    assert attrs.get("env_map") == {"DATABASE_HOST": "POSTGRES_HOST"}
+    assert "env_key_ref" in attrs.get("modes", [])
+
+    dep = repo / "service-a/base/deployment.yaml"
+    text = dep.read_text(encoding="utf-8")
+    start = text.index("          env:")
+    end = text.index("          envFrom:")
+    dep.write_text(text[:start] + text[end:], encoding="utf-8")
+
+    sync_envs(repo, db, Environment.STAGING)
+    attrs = _service_a_secret_edge_attrs(db)
+    assert "env_map" not in attrs
+    assert attrs.get("modes") == ["env_from"]

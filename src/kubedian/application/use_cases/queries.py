@@ -160,6 +160,122 @@ def datastore_clients(reader: GraphReader, datastore: str, env: Environment | No
     return {"datastore": node_id, "clients": [edge_dict(e, reader, other="src_id") for e in edges]}
 
 
+def service_secrets(reader: GraphReader, service: str, env: Environment | None) -> dict:
+    """Secrets and ConfigMaps a service consumes — KEY NAMES ONLY, never values."""
+    node_id = find_service_id(reader, service)
+    if node_id is None:
+        return {"error": f"no service matching {service!r}"}
+    secrets, configmaps = [], []
+    for e in reader.references(node_id, env):
+        dst = reader.node(e.dst_id)
+        if dst is None or dst.type not in (NodeType.SECRET, NodeType.CONFIGMAP):
+            continue
+        entry = {
+            "name": dst.name,
+            "node_id": dst.id,
+            "namespace": dst.namespace,
+            "modes": e.attrs.get("modes") or [e.signal.value],
+            "keys": e.attrs.get("keys"),
+            "env_map": e.attrs.get("env_map"),
+            "provenance": e.provenance.value,
+            "environment": e.environment.value,
+            "source_file": e.source_file,
+        }
+        (secrets if dst.type == NodeType.SECRET else configmaps).append(entry)
+    return {
+        "service": node_dict(reader.node(node_id)),
+        "secrets": secrets,
+        "configmaps": configmaps,
+    }
+
+
+def service_ports(reader: GraphReader, service: str, env: Environment | None) -> dict:
+    """Every port fact known for a service: containerPorts, the Service's
+    port->targetPort wiring, and how it is exposed via Ingress/VirtualService."""
+    node_id = find_service_id(reader, service)
+    if node_id is None:
+        return {"error": f"no service matching {service!r}"}
+    node = reader.node(node_id)
+    exposed = []
+    for e in reader.callers(node_id, env):
+        if e.type != EdgeType.ROUTES_TO:
+            continue
+        d = edge_dict(e, reader, other="src_id")
+        d["port"] = e.attrs.get("port")
+        d["port_name"] = e.attrs.get("port_name")
+        exposed.append(d)
+    return {
+        "service": node_dict(node),
+        "container_ports": node.attrs.get("ports") or [],
+        "named_ports": node.attrs.get("named_ports"),
+        "service_ports": node.attrs.get("port_map") or [],
+        "exposed_via": exposed,
+    }
+
+
+def find_key_usage(
+    reader: GraphReader,
+    query: str,
+    env: Environment | None,
+    partial: bool = False,
+    limit: int = 100,
+) -> dict:
+    """Reverse lookup by env var / secret key NAME. Returns who consumes it, from
+    which Secret/ConfigMap, and through which env var — names only, never values."""
+    q = query.lower()
+
+    def _matches(name: str) -> bool:
+        return q in name.lower() if partial else q == name.lower()
+
+    matches = []
+    for e in reader.find_key_refs(query, env, partial=partial):
+        src = reader.node(e.src_id)
+        dst = reader.node(e.dst_id)
+        env_map: dict = e.attrs.get("env_map") or {}
+        modes = e.attrs.get("modes") or [e.signal.value]
+        base = {
+            "workload": src.name if src else e.src_id,
+            "workload_id": e.src_id,
+            "ref": dst.name if dst else e.dst_id,
+            "ref_node_id": e.dst_id,
+            "ref_type": dst.type.value if dst else None,
+            "environment": e.environment.value,
+            "provenance": e.provenance.value,
+            "source_file": e.source_file,
+        }
+        # Expand the edge into per-key matches: valueFrom keys carry their env var
+        # name; envFrom keys ARE the var name; volume-mounted keys have no var.
+        # A key consumed through several modes yields one match per mode.
+        for var, key in env_map.items():
+            if _matches(var) or _matches(key):
+                matches.append({**base, "var": var, "key": key, "mode": "env_key_ref"})
+        other_mode = next((m for m in modes if m != "env_key_ref"), None)
+        if other_mode:
+            for key in e.attrs.get("keys") or []:
+                if not _matches(key):
+                    continue
+                matches.append({
+                    **base,
+                    "var": key if other_mode == "env_from" else None,
+                    "key": key,
+                    "mode": other_mode,
+                })
+    return {"query": query, "match_count": len(matches), "matches": matches[:limit]}
+
+
+def find_port(reader: GraphReader, port: int, env: Environment | None) -> dict:
+    """Who listens on / routes to a given port number."""
+    listeners = [node_dict(n) for n in reader.nodes_with_port(port)]
+    routes = []
+    for e in reader.routes_with_port(port, env):
+        d = edge_dict(e, reader, other="dst_id")
+        src = reader.node(e.src_id)
+        d["via"] = src.name if src else e.src_id
+        d["port"] = e.attrs.get("port")
+        routes.append(d)
+    return {"port": port, "listeners": listeners, "routed_by": routes}
+
+
 def status(reader: GraphReader) -> dict:
     from collections import Counter
 

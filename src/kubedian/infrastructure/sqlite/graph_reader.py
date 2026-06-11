@@ -108,6 +108,70 @@ class GraphReader:
         rows = self._conn.execute(f"SELECT * FROM edges{where}", params)
         return [self._edge(r) for r in rows]
 
+    def references(self, node_id: str, environment: Environment | None = None) -> list[Edge]:
+        """Outgoing REFERENCES edges of a workload (its Secrets/ConfigMaps)."""
+        clause, params = self._env_clause(environment)
+        rows = self._conn.execute(
+            f"SELECT * FROM edges WHERE src_id = ? AND type = ?{clause} ORDER BY dst_id",
+            [node_id, EdgeType.REFERENCES.value, *params],
+        )
+        return [self._edge(r) for r in rows]
+
+    def find_key_refs(
+        self,
+        query: str,
+        environment: Environment | None = None,
+        *,
+        partial: bool = False,
+    ) -> list[Edge]:
+        """Reverse lookup: REFERENCES edges whose consumed key names — or the env
+        var names mapped to them — match ``query``. Matches NAMES only; secret
+        values are never stored, so they can never be searched or returned."""
+        clause, params = self._env_clause(environment)
+        if partial:
+            match, arg = "LIKE ? COLLATE NOCASE", f"%{query}%"
+        else:
+            match, arg = "= ? COLLATE NOCASE", query
+        sql = f"""
+            SELECT DISTINCT e.* FROM edges e
+            WHERE e.type = ?{clause} AND (
+                EXISTS (SELECT 1 FROM json_each(e.attrs, '$.keys') k
+                        WHERE k.value {match})
+                OR EXISTS (SELECT 1 FROM json_each(e.attrs, '$.env_map') m
+                           WHERE m.key {match} OR m.value {match})
+            )
+            ORDER BY e.src_id
+        """
+        rows = self._conn.execute(
+            sql, [EdgeType.REFERENCES.value, *params, arg, arg, arg]
+        )
+        return [self._edge(r) for r in rows]
+
+    def nodes_with_port(self, port: int) -> list[Node]:
+        """Nodes that listen on / expose ``port`` (containerPorts or Service ports)."""
+        sql = """
+            SELECT DISTINCT n.* FROM nodes n
+            WHERE EXISTS (SELECT 1 FROM json_each(n.attrs, '$.ports') p
+                          WHERE p.value = ?)
+               OR EXISTS (SELECT 1 FROM json_each(n.attrs, '$.port_map') pm
+                          WHERE json_extract(pm.value, '$.port') = ?
+                             OR json_extract(pm.value, '$.target_port') = ?)
+            ORDER BY n.name
+        """
+        rows = self._conn.execute(sql, [port, port, port])
+        return [self._node(r) for r in rows]
+
+    def routes_with_port(self, port: int, environment: Environment | None = None) -> list[Edge]:
+        """ROUTES_TO edges (Ingress/VirtualService) that target ``port``."""
+        clause, params = self._env_clause(environment)
+        sql = f"""
+            SELECT * FROM edges
+            WHERE type = ?{clause} AND json_extract(attrs, '$.port') = ?
+            ORDER BY src_id
+        """
+        rows = self._conn.execute(sql, [EdgeType.ROUTES_TO.value, *params, port])
+        return [self._edge(r) for r in rows]
+
     def graph(self, environment: Environment | None = None) -> Graph:
         """Load the full graph, optionally filtered to one environment.
 

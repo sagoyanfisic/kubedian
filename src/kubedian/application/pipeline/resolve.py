@@ -28,7 +28,7 @@ from kubedian.domain.entities.graph import (
     Provenance,
     Signal,
 )
-from kubedian.domain.entities.resource import DeploymentView, K8sResource
+from kubedian.domain.entities.resource import DeploymentView, EnvKeyRef, K8sResource
 
 
 @dataclass
@@ -168,10 +168,21 @@ def _register_services(graph: Graph, index: _ServiceIndex, result: ExtractResult
         index.by_alias.setdefault((ns, res.name), target)
         # Many workloads omit containerPort; the Service declares the real port.
         node = graph.nodes.get(target)
-        if node is not None and not node.attrs.get("ports"):
-            sp = _service_ports(res.raw)
-            if sp:
-                node.attrs["ports"] = sp
+        if node is not None:
+            if not node.attrs.get("ports"):
+                sp = _service_ports(res.raw)
+                if sp:
+                    node.attrs["ports"] = sp
+            # Several Services may front the same workload (e.g. an edge proxy
+            # selecting another service's pods) — keep every distinct wiring,
+            # tagged with the Service that declares it.
+            pm = _service_port_map(res.raw, node.attrs.get("named_ports"))
+            if pm:
+                existing = node.attrs.setdefault("port_map", [])
+                for entry in pm:
+                    entry["service"] = res.name
+                    if entry not in existing:
+                        existing.append(entry)
         nodes.append(target)
     return nodes
 
@@ -187,6 +198,29 @@ def _service_ports(raw: dict) -> list[int]:
         if isinstance(val, int):
             ports.append(val)
     return list(dict.fromkeys(ports))
+
+
+def _service_port_map(raw: dict, named_ports: dict | None) -> list[dict]:
+    """The Service's declared port wiring, one entry per spec.ports[] item.
+
+    ``target_port`` is the resolved container port: a named targetPort is looked
+    up in the workload's named containerPorts; an absent targetPort defaults to
+    ``port`` (Kubernetes' own default).
+    """
+    entries: list[dict] = []
+    for p in (raw.get("spec") or {}).get("ports") or []:
+        if not isinstance(p, dict) or not isinstance(p.get("port"), int):
+            continue
+        target = p.get("targetPort", p["port"])
+        if isinstance(target, str):
+            target = (named_ports or {}).get(target, target)
+        entries.append({
+            "name": p.get("name"),
+            "port": p["port"],
+            "target_port": target,
+            "protocol": p.get("protocol") or "TCP",
+        })
+    return entries
 
 
 def _dedup_edges(edges: list[Edge]) -> list[Edge]:
@@ -205,13 +239,31 @@ def _dedup_edges(edges: list[Edge]) -> list[Edge]:
             locators.append(existing.source_locator)
         if edge.source_locator and edge.source_locator not in locators:
             locators.append(edge.source_locator)
+        if edge.type == EdgeType.REFERENCES:
+            # The same Secret/ConfigMap may be consumed through several modes
+            # (envFrom + valueFrom + volume). Edge.key collapses them into one
+            # edge, so union the consumption facts instead of dropping them.
+            _merge_reference_attrs(existing.attrs, edge.attrs)
         # prefer explicit provenance / higher confidence
         if (existing.provenance != Provenance.EXPLICIT and edge.provenance == Provenance.EXPLICIT) or (
             edge.confidence > existing.confidence
         ):
             edge.attrs["locators"] = locators
+            if edge.type == EdgeType.REFERENCES:
+                _merge_reference_attrs(edge.attrs, existing.attrs)
             merged[key] = edge
     return list(merged.values())
+
+
+def _merge_reference_attrs(target: dict, other: dict) -> None:
+    """Union ``keys``/``modes`` and merge ``env_map`` of two REFERENCES edges."""
+    for field_name in ("keys", "modes"):
+        values = list(target.get(field_name) or []) + list(other.get(field_name) or [])
+        if values:
+            target[field_name] = list(dict.fromkeys(values))
+    env_map = {**(other.get("env_map") or {}), **(target.get("env_map") or {})}
+    if env_map:
+        target["env_map"] = env_map
 
 
 # --------------------------------------------------------------------------- #
@@ -255,6 +307,12 @@ def _node_type_for(workload_kind: str) -> NodeType:
 def _workload_attrs(result: ExtractResult, dep: DeploymentView) -> dict:
     """Per-workload facts kept on its service node."""
     image = next((c.image for c in dep.containers if c.image), None)
+    # Env var NAMES only (literals + valueFrom targets) — values are never stored.
+    env_vars: set[str] = set()
+    for c in dep.containers:
+        env_vars.update(c.env.keys())
+        env_vars.update(r.var for r in c.secret_key_refs)
+        env_vars.update(r.var for r in c.configmap_key_refs)
     return {
         "render_mode": result.render_mode.value,
         "image": image,
@@ -262,6 +320,8 @@ def _workload_attrs(result: ExtractResult, dep: DeploymentView) -> dict:
         "workload_kind": dep.workload_kind,
         "replicas": dep.replicas,
         "ports": list(dep.ports),
+        "named_ports": dict(dep.named_ports) or None,
+        "env_vars": sorted(env_vars),
         "service_account": dep.service_account,
         "nodepool": dep.nodepool,
     }
@@ -291,6 +351,26 @@ def _collect_discovery_configmaps(index: _ServiceIndex, result: ExtractResult) -
 # --------------------------------------------------------------------------- #
 # Pass 2 helpers
 # --------------------------------------------------------------------------- #
+def _configmap_key_index(result: ExtractResult) -> dict[str, list[str]]:
+    """ConfigMap name -> its data key names (names only, values are never kept)."""
+    out: dict[str, list[str]] = {}
+    for res in result.resources:
+        if res.kind != "ConfigMap" or not res.name:
+            continue
+        keys = list((res.raw.get("data") or {}).keys()) + list((res.raw.get("binaryData") or {}).keys())
+        if keys:
+            out[res.name] = [str(k) for k in keys]
+    return out
+
+
+def _group_key_refs(refs: tuple[EnvKeyRef, ...]) -> dict[str, list[EnvKeyRef]]:
+    """Group a container's valueFrom refs by referenced Secret/ConfigMap name."""
+    grouped: dict[str, list[EnvKeyRef]] = {}
+    for r in refs:
+        grouped.setdefault(r.ref, []).append(r)
+    return grouped
+
+
 def _resolve_service_edges(
     graph: Graph,
     index: _ServiceIndex,
@@ -300,12 +380,20 @@ def _resolve_service_edges(
     env: Environment,
 ) -> None:
     secret_index = {s.name: s for s in result.secrets}
+    configmap_index = _configmap_key_index(result)
 
     for dep, node_id in pairs:
+        dep_ns = graph.nodes[node_id].namespace or "default"
         for container in dep.containers:
             # 1. configmaps consumed via envFrom -> http_calls (heuristic if the
-            #    configmap is a shared service-discovery catalog).
+            #    configmap is a shared service-discovery catalog). Either way the
+            #    workload also REFERENCES the configmap itself (key names only).
             for cm_name in container.env_from_configmaps:
+                _emit_reference(
+                    graph, node_id, NodeType.CONFIGMAP, "cm", dep_ns, cm_name, env,
+                    dep.resource.source_file, signal=Signal.ENV_FROM,
+                    keys=configmap_index.get(cm_name),
+                )
                 targets = index.discovery_configmaps.get(cm_name)
                 if not targets:
                     continue
@@ -316,6 +404,46 @@ def _resolve_service_edges(
                         continue
                     _emit_configmap_call(
                         graph, node_id, dst, env, cm_name, env_key,
+                        dep.resource.source_file, catalog=catalog,
+                    )
+
+            # 1b. single keys wired via env[].valueFrom.{secret,configMap}KeyRef:
+            #     one REFERENCES edge per referenced object carrying var->key names
+            #     (never values), plus the same key-name heuristics as envFrom.
+            for ref_name, refs in _group_key_refs(container.secret_key_refs).items():
+                secret = secret_index.get(ref_name)
+                secret_attrs = (
+                    {"keys": list(secret.key_names), "source_file": secret.source_file}
+                    if secret else None
+                )
+                _emit_reference(
+                    graph, node_id, NodeType.SECRET, "secret", dep_ns, ref_name, env,
+                    dep.resource.source_file, node_attrs=secret_attrs,
+                    signal=Signal.ENV_KEY_REF,
+                    keys=[r.key for r in refs],
+                    env_map={r.var: r.key for r in refs},
+                )
+                for r in refs:
+                    _emit_heuristic(graph, node_id, result.overlay.service, env, r.var,
+                                    dep.resource.source_file)
+            for ref_name, refs in _group_key_refs(container.configmap_key_refs).items():
+                _emit_reference(
+                    graph, node_id, NodeType.CONFIGMAP, "cm", dep_ns, ref_name, env,
+                    dep.resource.source_file, signal=Signal.ENV_KEY_REF,
+                    keys=[r.key for r in refs],
+                    env_map={r.var: r.key for r in refs},
+                )
+                targets = index.discovery_configmaps.get(ref_name) or {}
+                catalog = ref_name in index.catalog_configmaps
+                for r in refs:
+                    target = targets.get(r.key)
+                    if target is None:
+                        continue
+                    dst = _ensure_service_target(graph, index, target)
+                    if dst == node_id:
+                        continue
+                    _emit_configmap_call(
+                        graph, node_id, dst, env, ref_name, r.key,
                         dep.resource.source_file, catalog=catalog,
                     )
 
@@ -351,10 +479,10 @@ def _resolve_service_edges(
                 # location (never values), so keys without a datastore match aren't lost.
                 _emit_reference(
                     graph, node_id, NodeType.SECRET, "secret",
-                    graph.nodes[node_id].namespace or "default", secret_name, env,
+                    dep_ns, secret_name, env,
                     secret.source_file,
                     node_attrs={"keys": list(secret.key_names), "source_file": secret.source_file},
-                    signal=Signal.SECRET_KEY_NAME,
+                    signal=Signal.ENV_FROM,
                 )
 
         # 4. volume-mounted config (per deployment, not per container)
@@ -448,15 +576,19 @@ def _virtualservice_routes(
             if not isinstance(rule, dict):
                 continue
             for route in rule.get("route") or []:
-                host = ((route or {}).get("destination") or {}).get("host")
+                destination = (route or {}).get("destination") or {}
+                host = destination.get("host")
                 dst = _resolve_route_host(graph, index, host, default_ns)
                 if dst is None:
                     continue
+                port = (destination.get("port") or {}).get("number")
+                route_attrs = {"port": port} if isinstance(port, int) else {}
                 if dst != node_id:
                     graph.add_edge(Edge(
                         src_id=node_id, dst_id=dst, type=EdgeType.ROUTES_TO, environment=env,
                         provenance=Provenance.EXPLICIT, signal=Signal.ISTIO_VS,
                         source_file=res.source_file, source_locator=str(host),
+                        attrs=dict(route_attrs),
                     ))
                 for gw_id in gw_ids:
                     if gw_id == dst:
@@ -465,6 +597,7 @@ def _virtualservice_routes(
                         src_id=gw_id, dst_id=dst, type=EdgeType.ROUTES_TO, environment=env,
                         provenance=Provenance.EXPLICIT, signal=Signal.GATEWAY_BINDING,
                         source_file=res.source_file, source_locator=str(host),
+                        attrs=dict(route_attrs),
                     ))
 
 
@@ -488,14 +621,28 @@ def _ingress_routes(
         graph.add_node(Node(id=host_id, type=NodeType.INGRESS_HOST, name=str(host)))
         for path in ((rule.get("http") or {}).get("paths") or []):
             backend = (path or {}).get("backend") or {}
-            name = ((backend.get("service") or {}).get("name")) or backend.get("serviceName")
+            svc_backend = backend.get("service") or {}
+            name = svc_backend.get("name") or backend.get("serviceName")
             if not name:
                 continue
+            # networking.k8s.io/v1 uses service.port.{number,name}; the legacy
+            # extensions/v1beta1 shape is a bare servicePort (int or name).
+            port = (svc_backend.get("port") or {}) if isinstance(svc_backend.get("port"), dict) else {}
+            route_attrs: dict = {}
+            if isinstance(port.get("number"), int):
+                route_attrs["port"] = port["number"]
+            elif port.get("name"):
+                route_attrs["port_name"] = str(port["name"])
+            elif isinstance(backend.get("servicePort"), int):
+                route_attrs["port"] = backend["servicePort"]
+            elif backend.get("servicePort"):
+                route_attrs["port_name"] = str(backend["servicePort"])
             dst = _ensure_service_target(graph, index, ClusterTarget(service=str(name), namespace=ns))
             graph.add_edge(Edge(
                 src_id=host_id, dst_id=dst, type=EdgeType.ROUTES_TO, environment=env,
                 provenance=Provenance.EXPLICIT, signal=Signal.INGRESS_BACKEND,
                 source_file=res.source_file, source_locator=str(name),
+                attrs=route_attrs,
             ))
 
 
@@ -840,19 +987,30 @@ def _emit_reference(
     source_file: str,
     node_attrs: dict | None = None,
     signal: Signal = Signal.VOLUME_MOUNT,
+    keys: list[str] | None = None,
+    env_map: dict[str, str] | None = None,
 ) -> None:
     """Record that a service mounts/consumes a ConfigMap/Secret as config (no values read).
 
     ``node_attrs`` may carry the referenced object's own metadata — for a Secret
     the key/env-var *names* and the file it is defined in — never any secret value.
-    ``signal`` distinguishes a volume mount from an ``envFrom`` reference.
+    ``signal`` distinguishes a volume mount from an ``envFrom`` / ``valueFrom``
+    reference; ``keys`` are the key names this workload consumes (defaults to the
+    referenced object's full key set) and ``env_map`` maps env var -> key for
+    single-key ``valueFrom`` wiring. Names only, never values.
     """
     dst_id = f"{prefix}:{ns}/{name}"
     graph.add_node(Node(id=dst_id, type=node_type, name=name, namespace=ns, attrs=node_attrs or {}))
     # The edge already carries the environment and the app (src_id), so putting the
     # key NAMES here pins each variable to its (app, environment) — one edge per
     # (app, secret, env), so it never merges across environments like the node does.
-    edge_attrs = {"keys": list(node_attrs["keys"])} if node_attrs and node_attrs.get("keys") else {}
+    edge_attrs: dict = {"modes": [signal.value]}
+    if keys is None and node_attrs and node_attrs.get("keys"):
+        keys = list(node_attrs["keys"])
+    if keys:
+        edge_attrs["keys"] = list(dict.fromkeys(keys))
+    if env_map:
+        edge_attrs["env_map"] = dict(env_map)
     graph.add_edge(
         Edge(
             src_id=src_id,

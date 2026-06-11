@@ -39,12 +39,27 @@ class K8sResource:
 
 
 @dataclass(frozen=True)
+class EnvKeyRef:
+    """One env var wired to a single Secret/ConfigMap key via ``valueFrom``.
+
+    Carries only NAMES (env var, referenced object, key) — never the value.
+    """
+
+    var: str  # env var name inside the container
+    ref: str  # name of the referenced Secret/ConfigMap
+    key: str  # key inside the referenced object
+
+
+@dataclass(frozen=True)
 class ContainerView:
     name: str
     image: str | None
     env: dict[str, str]  # only literal values (valueFrom is captured separately)
     env_from_secrets: list[str]
     env_from_configmaps: list[str]
+    # env[].valueFrom.secretKeyRef / configMapKeyRef — names only, never values.
+    secret_key_refs: tuple[EnvKeyRef, ...] = ()
+    configmap_key_refs: tuple[EnvKeyRef, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -61,6 +76,8 @@ class DeploymentView:
     workload_kind: str = "Deployment"
     replicas: int | None = None
     ports: tuple[int, ...] = ()
+    # containerPort name -> number, for resolving Services' named targetPorts.
+    named_ports: dict[str, int] = field(default_factory=dict)
     service_account: str | None = None
     # Node pool the workload is scheduled onto, from the `purpose` node label
     # (nodeSelector / required nodeAffinity). None when the workload doesn't pin a pool.

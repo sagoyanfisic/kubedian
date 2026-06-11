@@ -47,3 +47,33 @@ def test_full_index_db_carries_no_secret_values(tmp_path):
     blob = Path(db).read_bytes().decode("latin-1")
     assert "ENC[" not in blob
     assert "AES256_GCM" not in blob
+
+
+def test_config_query_surfaces_carry_no_secret_values(tmp_path):
+    """The new config surfaces (service_secrets / find_key_usage / service_ports)
+    are built from key NAMES only — their full JSON output must pass the guard."""
+    import json
+
+    from kubedian.application.pipeline.index import index_repo
+    from kubedian.application.use_cases import queries
+    from kubedian.domain.entities.graph import Environment
+    from kubedian.infrastructure.sqlite.graph_reader import GraphReader
+    from tests.conftest import GATEWAY_SECRET_VALUE, write_sample_repo
+
+    repo = write_sample_repo(tmp_path)
+    db = tmp_path / "graph.db"
+    index_repo(repo, db, Environment.STAGING)
+    reader = GraphReader(db)
+    try:
+        outputs = [
+            queries.service_secrets(reader, "service-a", None),
+            queries.service_secrets(reader, "gateway", None),
+            queries.service_ports(reader, "service-b", None),
+            queries.find_key_usage(reader, "_", None, partial=True),
+            queries.find_port(reader, 8080, None),
+        ]
+    finally:
+        reader.close()
+    blob = json.dumps(outputs)
+    assert_no_secret_values(blob)
+    assert GATEWAY_SECRET_VALUE not in blob

@@ -58,6 +58,17 @@ def write_sample_repo(root: Path) -> Path:
               containers:
                 - name: api
                   image: example/service-a:latest
+                  env:
+                    - name: DATABASE_HOST
+                      valueFrom:
+                        secretKeyRef:
+                          name: service-a-secret
+                          key: POSTGRES_HOST
+                    - name: FEATURE_FLAG
+                      valueFrom:
+                        configMapKeyRef:
+                          name: service-a-config
+                          key: feature_flag
                   envFrom:
                     - configMapRef:
                         name: service-discovery
@@ -88,6 +99,21 @@ def write_sample_repo(root: Path) -> Path:
         resources:
           - ../../base
           - secrets.yaml
+          - config.yaml
+        """,
+    )
+    # Plain (non-discovery) configmap consumed key-by-key via valueFrom.
+    _w(
+        repo / "service-a/overlays/staging/config.yaml",
+        """
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: service-a-config
+          namespace: ns-a
+        data:
+          feature_flag: "on"
+          log_level: "info"
         """,
     )
     # SOPS-style secret: plaintext KEYS, encrypted VALUES.
@@ -131,6 +157,9 @@ def write_sample_repo(root: Path) -> Path:
               containers:
                 - name: api
                   image: example/service-b:latest
+                  ports:
+                    - name: http
+                      containerPort: 8080
         """,
     )
     _w(
@@ -145,7 +174,9 @@ def write_sample_repo(root: Path) -> Path:
           selector:
             app: service-b
           ports:
-            - port: 80
+            - name: http
+              port: 80
+              targetPort: http
         """,
     )
     _w(
@@ -200,6 +231,8 @@ def write_sample_repo(root: Path) -> Path:
             - route:
                 - destination:
                     host: service-b.ns-b.svc.cluster.local
+                    port:
+                      number: 8080
         """,
     )
     _w(
@@ -240,6 +273,8 @@ def write_sample_repo(root: Path) -> Path:
                     backend:
                       service:
                         name: gateway
+                        port:
+                          number: 80
         """,
     )
     _w(

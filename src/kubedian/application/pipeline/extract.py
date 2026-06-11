@@ -15,6 +15,7 @@ from kubedian.application.pipeline.discover import Overlay
 from kubedian.domain.entities.resource import (
     ContainerView,
     DeploymentView,
+    EnvKeyRef,
     HelmChartRef,
     K8sResource,
     RenderMode,
@@ -122,14 +123,32 @@ def _deployment_view(res: K8sResource) -> DeploymentView:
     containers_raw = pod_spec.get("containers") or []
     containers: list[ContainerView] = []
     ports: list[int] = []
+    named_ports: dict[str, int] = {}
     for c in containers_raw:
         for p in c.get("ports") or []:
             if isinstance(p, dict) and isinstance(p.get("containerPort"), int):
                 ports.append(p["containerPort"])
+                if p.get("name"):
+                    named_ports[str(p["name"])] = p["containerPort"]
         env_literals: dict[str, str] = {}
+        secret_key_refs: list[EnvKeyRef] = []
+        cm_key_refs: list[EnvKeyRef] = []
         for e in c.get("env") or []:
-            if isinstance(e, dict) and "value" in e and "name" in e:
+            if not isinstance(e, dict) or "name" not in e:
+                continue
+            if "value" in e:
                 env_literals[str(e["name"])] = str(e["value"])
+                continue
+            # valueFrom wiring: record only NAMES (var, ref, key) — never the value.
+            vf = e.get("valueFrom") or {}
+            if (skr := vf.get("secretKeyRef")) and skr.get("name") and skr.get("key"):
+                secret_key_refs.append(
+                    EnvKeyRef(var=str(e["name"]), ref=str(skr["name"]), key=str(skr["key"]))
+                )
+            if (ckr := vf.get("configMapKeyRef")) and ckr.get("name") and ckr.get("key"):
+                cm_key_refs.append(
+                    EnvKeyRef(var=str(e["name"]), ref=str(ckr["name"]), key=str(ckr["key"]))
+                )
         secret_refs: list[str] = []
         cm_refs: list[str] = []
         for ef in c.get("envFrom") or []:
@@ -146,6 +165,8 @@ def _deployment_view(res: K8sResource) -> DeploymentView:
                 env=env_literals,
                 env_from_secrets=secret_refs,
                 env_from_configmaps=cm_refs,
+                secret_key_refs=tuple(secret_key_refs),
+                configmap_key_refs=tuple(cm_key_refs),
             )
         )
     secret_vols: list[str] = []
@@ -182,6 +203,7 @@ def _deployment_view(res: K8sResource) -> DeploymentView:
         workload_kind=res.kind,
         replicas=replicas if isinstance(replicas, int) else None,
         ports=tuple(dict.fromkeys(ports)),
+        named_ports=named_ports,
         service_account=pod_spec.get("serviceAccountName"),
         nodepool=_nodepool(pod_spec),
         pvc_volumes=tuple(dict.fromkeys(pvc_vols)),

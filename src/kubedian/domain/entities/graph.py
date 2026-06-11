@@ -81,6 +81,8 @@ class Signal(StrEnum):
     SELECTOR = "selector"
     NAMESPACE = "namespace"
     VOLUME_MOUNT = "volume_mount"
+    ENV_FROM = "env_from"  # whole Secret/ConfigMap injected via envFrom
+    ENV_KEY_REF = "env_key_ref"  # single key via env[].valueFrom.{secret,configMap}KeyRef
     DOC_MERMAID = "doc_mermaid"  # parsed from a Mermaid diagram in the docs
 
 
