@@ -4,7 +4,6 @@ Everything here must surface NAMES and relations only — never a secret value.
 """
 
 import json
-from textwrap import dedent
 
 import pytest
 
@@ -13,7 +12,7 @@ from kubedian.application.use_cases import queries
 from kubedian.domain.entities.graph import Environment
 from kubedian.infrastructure.sanitize import assert_no_secret_values
 from kubedian.infrastructure.sqlite.graph_reader import GraphReader
-from tests.conftest import GATEWAY_SECRET_VALUE, write_sample_repo
+from tests.conftest import GATEWAY_SECRET_VALUE, repo_writer, write_sample_repo
 
 
 @pytest.fixture()
@@ -103,12 +102,7 @@ def test_composition_bundle_and_rbac(tmp_path):
     """An api+worker bundle: composition of the api lists the worker as a bundle
     sibling, and the roles granted to its ServiceAccount appear under rbac."""
     repo = tmp_path / "r"
-
-    def w(rel: str, text: str) -> None:
-        p = repo / rel
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(dedent(text).lstrip(), encoding="utf-8")
-
+    w = repo_writer(repo)
     w(
         "billing/base/api.yaml",
         """

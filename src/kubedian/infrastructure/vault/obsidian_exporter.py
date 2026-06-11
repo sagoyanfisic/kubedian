@@ -6,10 +6,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from kubedian.infrastructure.mermaid import mermaid_renderer
-from kubedian.infrastructure.sanitize import assert_no_secret_values
 from kubedian.domain.entities.graph import Edge, EdgeType, Graph, Node, NodeType
 from kubedian.i18n import t
+from kubedian.infrastructure.mermaid import mermaid_renderer
+from kubedian.infrastructure.sanitize import assert_no_secret_values
 
 _TAG = {
     NodeType.SERVICE: "service",
@@ -39,7 +39,6 @@ _EDGE_FIELD = {
     EdgeType.DEPENDS_ON_CHART: "Depends on chart",
     EdgeType.ROUTES_TO: "Routes to",
     EdgeType.ALLOWS_TO: "Allowed to reach",
-    EdgeType.SELECTS: "Selects",
     EdgeType.MOUNTS: "Mounts",
     EdgeType.SCALES: "Scales",
     EdgeType.RUNS_AS: "Runs as",

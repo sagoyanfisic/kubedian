@@ -16,7 +16,12 @@ from collections import Counter
 from dataclasses import dataclass, field
 
 from kubedian.application.heuristics import env_key_rules
-from kubedian.application.heuristics.dns import ClusterTarget, is_cluster_internal, parse_cluster_host
+from kubedian.application.heuristics.dns import (
+    ClusterTarget,
+    extract_host,
+    is_cluster_internal,
+    parse_cluster_host,
+)
 from kubedian.application.pipeline.extract import ExtractResult
 from kubedian.domain.entities.graph import (
     Edge,
@@ -1207,9 +1212,7 @@ def _emit_external(
     source_file: str,
     signal: Signal,
 ) -> None:
-    from kubedian.application.heuristics.dns import _extract_host
-
-    host = _extract_host(value) or value
+    host = extract_host(value) or value
     dst_id = _ensure_external_node(graph, host)
     graph.add_edge(
         Edge(

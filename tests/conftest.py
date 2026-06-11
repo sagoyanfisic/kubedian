@@ -10,10 +10,30 @@ from __future__ import annotations
 from pathlib import Path
 from textwrap import dedent
 
+from kubedian.application.pipeline.discover import discover_overlays
+from kubedian.application.pipeline.extract import extract_overlay
+from kubedian.application.pipeline.resolve import resolve
+from kubedian.domain.entities.graph import Environment
+
 
 def _w(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(dedent(text).lstrip(), encoding="utf-8")
+
+
+def repo_writer(repo: Path):
+    """Writer for inline test repos: ``w("svc/base/x.yaml", yaml_text)``."""
+
+    def w(rel: str, text: str) -> None:
+        _w(repo / rel, text)
+
+    return w
+
+
+def build_graph(repo: Path, environment: Environment = Environment.STAGING):
+    """Run discover → extract → resolve over a test repo."""
+    overlays = discover_overlays(repo, environment)
+    return resolve([extract_overlay(o) for o in overlays])
 
 
 def write_sample_repo(root: Path) -> Path:

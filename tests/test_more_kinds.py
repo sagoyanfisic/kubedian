@@ -1,38 +1,18 @@
 """Phase-2 kinds: ExternalName Services, PodDisruptionBudget, RBAC bindings,
 Keda ScaledObjects, and the ignored-kinds counter in status()."""
 
-from pathlib import Path
-from textwrap import dedent
-
-from kubedian.application.pipeline.discover import discover_overlays
-from kubedian.application.pipeline.extract import extract_overlay
 from kubedian.application.pipeline.index import index_repo
-from kubedian.application.pipeline.resolve import resolve
 from kubedian.application.use_cases import queries
 from kubedian.domain.entities.graph import EdgeType, Environment, NodeType, Signal
 from kubedian.infrastructure.sqlite.graph_reader import GraphReader
-
-
-def _graph_for(repo: Path):
-    overlays = discover_overlays(repo, Environment.STAGING)
-    results = [extract_overlay(o) for o in overlays]
-    return resolve(results)
-
-
-def _writer(repo: Path):
-    def w(rel: str, text: str) -> None:
-        p = repo / rel
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(dedent(text).lstrip(), encoding="utf-8")
-
-    return w
+from tests.conftest import build_graph, repo_writer
 
 
 def test_external_name_service_resolves_to_external_node(tmp_path):
     """A consumer of an ExternalName Service is really calling the external host:
     one calls_external edge to an ext: node, and no svc: ghost node is created."""
     repo = tmp_path / "r"
-    w = _writer(repo)
+    w = repo_writer(repo)
     w(
         "shop/base/app.yaml",
         """
@@ -69,7 +49,7 @@ def test_external_name_service_resolves_to_external_node(tmp_path):
         """,
     )
     w("shop/overlays/staging/kustomization.yaml", "namespace: shop\nresources:\n  - ../../base\n")
-    graph = _graph_for(repo)
+    graph = build_graph(repo)
     ext = graph.nodes["ext:api-payments-example-com"]
     assert ext.type == NodeType.EXTERNAL_API
     assert ext.attrs["host"] == "api.payments.example.com"
@@ -88,7 +68,7 @@ def test_external_name_never_shadows_workload_alias(tmp_path):
     """An ExternalName Service named like an existing workload must not re-point
     the workload's consumers to the external node (setdefault semantics)."""
     repo = tmp_path / "r"
-    w = _writer(repo)
+    w = repo_writer(repo)
     w(
         "shop/base/app.yaml",
         """
@@ -122,13 +102,13 @@ def test_external_name_never_shadows_workload_alias(tmp_path):
         """,
     )
     w("shop/overlays/staging/kustomization.yaml", "namespace: shop\nresources:\n  - ../../base\n")
-    graph = _graph_for(repo)
+    graph = build_graph(repo)
     assert graph.nodes["svc:shop/shop"].type == NodeType.SERVICE
 
 
 def test_pdb_attrs_land_on_matched_workload_and_skip_ambiguous(tmp_path):
     repo = tmp_path / "r"
-    w = _writer(repo)
+    w = repo_writer(repo)
     w(
         "billing/base/api.yaml",
         """
@@ -192,7 +172,7 @@ def test_pdb_attrs_land_on_matched_workload_and_skip_ambiguous(tmp_path):
         """,
     )
     w("billing/overlays/staging/kustomization.yaml", "namespace: billing\nresources:\n  - ../../base\n")
-    graph = _graph_for(repo)
+    graph = build_graph(repo)
     pdb = graph.nodes["svc:billing/billing"].attrs["disruption_budget"]
     assert pdb["name"] == "billing-api-pdb"
     assert pdb["min_available"] == 1
@@ -202,7 +182,7 @@ def test_pdb_attrs_land_on_matched_workload_and_skip_ambiguous(tmp_path):
 
 def test_rolebinding_grants_role_to_service_account(tmp_path):
     repo = tmp_path / "r"
-    w = _writer(repo)
+    w = repo_writer(repo)
     w(
         "billing/base/rbac.yaml",
         """
@@ -241,7 +221,7 @@ def test_rolebinding_grants_role_to_service_account(tmp_path):
         """,
     )
     w("billing/overlays/staging/kustomization.yaml", "namespace: billing\nresources:\n  - ../../base\n")
-    graph = _graph_for(repo)
+    graph = build_graph(repo)
     role = graph.nodes["role:billing/billing-reader"]
     assert role.type == NodeType.ROLE
     assert role.attrs["rules_count"] == 1
@@ -261,7 +241,7 @@ def test_rolebinding_grants_role_to_service_account(tmp_path):
 
 def test_keda_scaledobject_scales_with_trigger_types_only(tmp_path):
     repo = tmp_path / "r"
-    w = _writer(repo)
+    w = repo_writer(repo)
     w(
         "billing/base/api.yaml",
         """
@@ -301,7 +281,7 @@ def test_keda_scaledobject_scales_with_trigger_types_only(tmp_path):
         """,
     )
     w("billing/overlays/staging/kustomization.yaml", "namespace: billing\nresources:\n  - ../../base\n")
-    graph = _graph_for(repo)
+    graph = build_graph(repo)
     scaler = graph.nodes["hpa:billing/billing-scaler"]
     assert scaler.type == NodeType.AUTOSCALER
     assert scaler.attrs["kind"] == "ScaledObject"
@@ -318,7 +298,7 @@ def test_keda_scaledobject_scales_with_trigger_types_only(tmp_path):
 
 def test_status_counts_ignored_kinds(tmp_path):
     repo = tmp_path / "r"
-    w = _writer(repo)
+    w = repo_writer(repo)
     w(
         "billing/base/api.yaml",
         """

@@ -2,19 +2,18 @@
 
 from __future__ import annotations
 
+import json as _json
 from collections import Counter
 from pathlib import Path
 from typing import Optional
 
 import typer
 
-import json as _json
-
 from kubedian import __version__
 from kubedian.application.pipeline.index import index_repo
 from kubedian.application.pipeline.sync import sync_envs
 from kubedian.application.use_cases import queries
-from kubedian.config import DEFAULT_LANG, SUPPORTED_LANGS, default_db_path
+from kubedian.config import DEFAULT_LANG, SUPPORTED_LANGS, default_db_path, parse_env
 from kubedian.domain.entities.graph import Environment
 from kubedian.infrastructure.kustomize.runner import kustomize_available
 from kubedian.infrastructure.sqlite.graph_reader import GraphReader
@@ -112,7 +111,12 @@ def sync_envs_cmd(
 def _sync_with_progress(target: Path, db_path: Path, environment) -> dict:
     try:
         from rich.progress import (
-            BarColumn, MofNCompleteColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn,
+            BarColumn,
+            MofNCompleteColumn,
+            Progress,
+            SpinnerColumn,
+            TextColumn,
+            TimeElapsedColumn,
         )
     except ImportError:  # pragma: no cover - rich ships with typer
         return sync_envs(target, db_path, environment)
@@ -573,10 +577,8 @@ def _find_node_id(reader: GraphReader, focus: str) -> str:
 
 
 def _parse_env(env: Optional[str]) -> Optional[Environment]:
-    if env is None:
-        return None
     try:
-        return Environment(env.lower())
+        return parse_env(env)
     except ValueError:
         valid = ", ".join(e.value for e in Environment)
         raise typer.BadParameter(f"unknown environment {env!r}. Valid: {valid}")
@@ -636,13 +638,15 @@ def _print_summary(report, environment) -> None:
 
     # nodes + edges side by side
     nodes_tbl = Table(title=f"Nodes ({len(graph.nodes)})", title_style="bold", box=None, pad_edge=False)
-    nodes_tbl.add_column("Type"); nodes_tbl.add_column("Count", justify="right")
+    nodes_tbl.add_column("Type")
+    nodes_tbl.add_column("Count", justify="right")
     for typ, n in node_types.most_common():
         icon = _NODE_ICON.get(typ, "•")
         nodes_tbl.add_row(f"[{_NODE_STYLE.get(typ, 'white')}]{icon} {typ}[/]", str(n))
 
     edges_tbl = Table(title=f"Edges ({len(graph.edges)})", title_style="bold", box=None, pad_edge=False)
-    edges_tbl.add_column("Type"); edges_tbl.add_column("Count", justify="right")
+    edges_tbl.add_column("Type")
+    edges_tbl.add_column("Count", justify="right")
     for typ, n in edge_types.most_common():
         edges_tbl.add_row(f"[{_EDGE_STYLE.get(typ, 'white')}]{typ}[/]", str(n))
 

@@ -164,3 +164,73 @@ def test_sync_envs_sweeps_valuefrom_env_map(tmp_path):
     attrs = _service_a_secret_edge_attrs(db)
     assert "env_map" not in attrs
     assert attrs.get("modes") == ["env_from"]
+
+
+def test_sync_locator_representative_change_leaves_no_duplicate_rows(tmp_path):
+    """Edge.key excludes source_locator while SQLite's UNIQUE includes it. When
+    the representative locator of a merged edge changes between syncs (here: the
+    reads_from edge keyed on POSTGRES_HOST becomes keyed on DB_HOST), the old row
+    must be swept in the same transaction — never left as a duplicate."""
+    from tests.conftest import repo_writer
+
+    repo = tmp_path / "r"
+    w = repo_writer(repo)
+    w(
+        "billing/base/deployment.yaml",
+        """
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: billing
+          namespace: placeholder
+          labels: {app: billing}
+        spec:
+          template:
+            metadata:
+              labels: {app: billing}
+            spec:
+              containers:
+                - name: api
+                  image: x:1
+                  envFrom:
+                    - secretRef: {name: billing-secret}
+        """,
+    )
+    w("billing/overlays/staging/kustomization.yaml", "namespace: billing\nresources:\n  - ../../base\n  - secrets.yaml\n")
+
+    def _write_secret(key: str) -> None:
+        w(
+            "billing/overlays/staging/secrets.yaml",
+            f"""
+            apiVersion: v1
+            kind: Secret
+            metadata:
+              name: billing-secret
+              namespace: billing
+            stringData:
+              {key}: ENC[AES256_GCM,data:zz==,tag:yy==]
+            sops:
+              encrypted_regex: ^(data|stringData)$
+            """,
+        )
+
+    def _reads_from_rows() -> list[str]:
+        conn = sqlite3.connect(str(db))
+        try:
+            rows = conn.execute(
+                "SELECT source_locator FROM edges WHERE src_id = 'svc:billing/billing' "
+                "AND type = 'reads_from'"
+            ).fetchall()
+        finally:
+            conn.close()
+        return [r[0] for r in rows]
+
+    _write_secret("POSTGRES_HOST")
+    db = tmp_path / "graph.db"
+    index_repo(repo, db, Environment.STAGING)
+    assert _reads_from_rows() == ["POSTGRES_HOST"]
+
+    # Same postgres heuristic, different key name -> same logical edge, new locator.
+    _write_secret("DB_HOST")
+    sync_envs(repo, db, Environment.STAGING)
+    assert _reads_from_rows() == ["DB_HOST"]  # exactly one row, new locator

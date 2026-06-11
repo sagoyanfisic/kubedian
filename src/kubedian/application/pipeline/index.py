@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
-
-from collections import Counter
 
 from kubedian.application.pipeline.discover import discover_overlays
 from kubedian.application.pipeline.extract import ExtractResult, extract_overlay

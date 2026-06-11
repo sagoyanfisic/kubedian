@@ -6,12 +6,20 @@ GraphReader and returns plain dicts (already serialised, provenance included).
 
 from __future__ import annotations
 
-from collections import deque
+from collections import defaultdict, deque
 
 from kubedian.domain.entities.graph import EdgeType, Environment, NodeType
 from kubedian.infrastructure.sqlite.graph_reader import GraphReader
 
 _DATASTORE_TYPES = {NodeType.DATABASE, NodeType.CACHE, NodeType.QUEUE}
+
+
+def _edges_by_type(edges) -> dict[EdgeType, list]:
+    """Bucket a callers/callees edge list by EdgeType (shared traversal helper)."""
+    out: dict[EdgeType, list] = defaultdict(list)
+    for e in edges:
+        out[e.type].append(e)
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -107,13 +115,12 @@ def context(reader: GraphReader, service: str, env: Environment | None) -> dict:
             identity.append(edge_dict(e, reader, other="dst_id"))
         elif e.type == EdgeType.ROUTES_TO:
             routing.append(edge_dict(e, reader, other="dst_id"))
+    by_type = _edges_by_type(callers)
     return {
         "service": node_dict(node),
         "calls": calls,
         "called_by": [
-            edge_dict(e, reader, other="src_id")
-            for e in callers
-            if e.type == EdgeType.HTTP_CALLS
+            edge_dict(e, reader, other="src_id") for e in by_type[EdgeType.HTTP_CALLS]
         ],
         "datastores": datastores,
         "external_dependencies": external,
@@ -122,7 +129,7 @@ def context(reader: GraphReader, service: str, env: Environment | None) -> dict:
         "identity": identity,
         # HPA -> service is an incoming SCALES edge; surface the HPA as `autoscaler`
         # rather than the generic `service` key edge_dict uses for src direction.
-        "autoscaling": [_scaler_dict(e, reader) for e in callers if e.type == EdgeType.SCALES],
+        "autoscaling": [_scaler_dict(e, reader) for e in by_type[EdgeType.SCALES]],
     }
 
 
@@ -222,34 +229,27 @@ def service_composition(reader: GraphReader, service: str, env: Environment | No
     if node_id is None:
         return {"error": f"no service matching {service!r}"}
     node = reader.node(node_id)
-    callees = reader.callees(node_id, env)
-    callers = reader.callers(node_id, env)
+    out_edges = _edges_by_type(reader.callees(node_id, env))
+    in_edges = _edges_by_type(reader.callers(node_id, env))
 
-    storage, identity, egress_allowed = [], [], []
-    for e in callees:
-        if e.type == EdgeType.MOUNTS:
-            d = edge_dict(e, reader, other="dst_id")
-            d["mount_paths"] = e.attrs.get("mount_paths")
-            storage.append(d)
-        elif e.type == EdgeType.RUNS_AS:
-            identity.append(edge_dict(e, reader, other="dst_id"))
-        elif e.type == EdgeType.ALLOWS_TO:
-            egress_allowed.append(edge_dict(e, reader, other="dst_id"))
-    ingress_allowed, exposure = [], []
-    for e in callers:
-        if e.type == EdgeType.ALLOWS_TO:
-            ingress_allowed.append(edge_dict(e, reader, other="src_id"))
-        elif e.type == EdgeType.ROUTES_TO:
-            d = edge_dict(e, reader, other="src_id")
-            d["port"] = e.attrs.get("port")
-            d["port_name"] = e.attrs.get("port_name")
-            exposure.append(d)
+    storage = []
+    for e in out_edges[EdgeType.MOUNTS]:
+        d = edge_dict(e, reader, other="dst_id")
+        d["mount_paths"] = e.attrs.get("mount_paths")
+        storage.append(d)
+    identity = [edge_dict(e, reader, other="dst_id") for e in out_edges[EdgeType.RUNS_AS]]
+    egress_allowed = [edge_dict(e, reader, other="dst_id") for e in out_edges[EdgeType.ALLOWS_TO]]
+    ingress_allowed = [edge_dict(e, reader, other="src_id") for e in in_edges[EdgeType.ALLOWS_TO]]
+    exposure = []
+    for e in in_edges[EdgeType.ROUTES_TO]:
+        d = edge_dict(e, reader, other="src_id")
+        d["port"] = e.attrs.get("port")
+        d["port_name"] = e.attrs.get("port_name")
+        exposure.append(d)
 
     # Roles granted to the service's ServiceAccount(s) — one extra hop.
     rbac = []
-    for e in callees:
-        if e.type != EdgeType.RUNS_AS:
-            continue
+    for e in out_edges[EdgeType.RUNS_AS]:
         sa = reader.node(e.dst_id)
         for g in reader.callees(e.dst_id, env):
             if g.type != EdgeType.GRANTS:
@@ -276,7 +276,7 @@ def service_composition(reader: GraphReader, service: str, env: Environment | No
         "bundle": bundle,
         "config": {"secrets": secrets, "configmaps": configmaps},
         "storage": storage,
-        "autoscaling": [_scaler_dict(e, reader) for e in callers if e.type == EdgeType.SCALES],
+        "autoscaling": [_scaler_dict(e, reader) for e in in_edges[EdgeType.SCALES]],
         "service_account": identity,
         "rbac": rbac,
         "network_policies": {
@@ -284,6 +284,61 @@ def service_composition(reader: GraphReader, service: str, env: Environment | No
             "ingress_allowed_from": ingress_allowed,
         },
         "exposure": exposure,
+    }
+
+
+def list_namespaces(reader: GraphReader, env: Environment | None) -> dict:
+    """Namespaces with their services, job/cronjob counts, and cross-namespace call counts."""
+    by_ns: dict[str, list[dict]] = defaultdict(list)
+    jobs_by_ns: dict[str, int] = defaultdict(int)
+    cronjobs_by_ns: dict[str, int] = defaultdict(int)
+    ns_of: dict[str, str] = {}
+    for n in reader.nodes():
+        if not n.namespace:
+            continue
+        if n.type == NodeType.SERVICE:
+            by_ns[n.namespace].append(node_dict(n))
+            ns_of[n.id] = n.namespace
+        elif n.type == NodeType.JOB:
+            jobs_by_ns[n.namespace] += 1
+        elif n.type == NodeType.CRONJOB:
+            cronjobs_by_ns[n.namespace] += 1
+    cross: dict[str, int] = defaultdict(int)
+    for e in reader.edges(env):
+        if e.type == EdgeType.HTTP_CALLS:
+            s, d = ns_of.get(e.src_id), ns_of.get(e.dst_id)
+            if s and d and s != d:
+                cross[f"{s} → {d}"] += 1
+    all_ns = sorted(set(by_ns) | set(jobs_by_ns) | set(cronjobs_by_ns))
+    return {
+        "namespaces": [
+            {
+                "namespace": ns,
+                "service_count": len(by_ns.get(ns, [])),
+                "services": by_ns.get(ns, []),
+                "job_count": jobs_by_ns.get(ns, 0),
+                "cronjob_count": cronjobs_by_ns.get(ns, 0),
+            }
+            for ns in all_ns
+        ],
+        "cross_namespace_calls": dict(cross),
+    }
+
+
+def namespace_context(reader: GraphReader, namespace: str) -> dict:
+    """All workloads in a namespace: services (long-running), Jobs and CronJobs."""
+    buckets: dict[NodeType, list[dict]] = {NodeType.SERVICE: [], NodeType.JOB: [], NodeType.CRONJOB: []}
+    for n in reader.nodes_in_namespace(namespace):
+        if n.type in buckets:
+            buckets[n.type].append(node_dict(n))
+    return {
+        "namespace": namespace,
+        "service_count": len(buckets[NodeType.SERVICE]),
+        "services": buckets[NodeType.SERVICE],
+        "job_count": len(buckets[NodeType.JOB]),
+        "jobs": buckets[NodeType.JOB],
+        "cronjob_count": len(buckets[NodeType.CRONJOB]),
+        "cronjobs": buckets[NodeType.CRONJOB],
     }
 
 

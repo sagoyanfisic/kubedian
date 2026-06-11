@@ -95,7 +95,8 @@ Source of truth is **SQLite** (`.kubedian/graph.db`). Every other surface reads 
 
 ## Layout
 
-- `domain/` — entities (graph, resources) and repository interfaces.
+- `domain/` — pure entities (graph, resources); no ports/interfaces on purpose —
+  `infrastructure/sqlite/graph_reader.py` is the de-facto read port for every surface.
 - `application/pipeline/` — discover/render/extract/resolve/index.
 - `application/heuristics/` — env-key rules + DNS parsing.
 - `infrastructure/` — kustomize runner, sqlite store/reader, vault/mermaid/docs exporters.

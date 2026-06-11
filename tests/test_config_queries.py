@@ -4,7 +4,6 @@ Everything here must surface NAMES and relations only — never a secret value.
 """
 
 import json
-from pathlib import Path
 
 import pytest
 

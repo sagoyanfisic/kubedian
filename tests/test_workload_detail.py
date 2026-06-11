@@ -1,35 +1,15 @@
 """Phase-1 detail extraction: init/sidecar containers, probes, resources,
 mount paths, bundle attrs, and the CronJob jobTemplate pod-spec path."""
 
-from pathlib import Path
-from textwrap import dedent
-
-from kubedian.application.pipeline.discover import discover_overlays
-from kubedian.application.pipeline.extract import extract_overlay
-from kubedian.application.pipeline.resolve import resolve
-from kubedian.domain.entities.graph import EdgeType, Environment
-
-
-def _graph_for(repo: Path):
-    overlays = discover_overlays(repo, Environment.STAGING)
-    results = [extract_overlay(o) for o in overlays]
-    return resolve(results)
-
-
-def _writer(repo: Path):
-    def w(rel: str, text: str) -> None:
-        p = repo / rel
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(dedent(text).lstrip(), encoding="utf-8")
-
-    return w
+from kubedian.domain.entities.graph import EdgeType
+from tests.conftest import build_graph, repo_writer
 
 
 def test_cronjob_pod_spec_lives_under_job_template(tmp_path):
     """A CronJob's containers/env live at spec.jobTemplate.spec.template.spec —
     they must be extracted (they used to be silently lost)."""
     repo = tmp_path / "r"
-    w = _writer(repo)
+    w = repo_writer(repo)
     w(
         "backup/base/cronjob.yaml",
         """
@@ -54,7 +34,7 @@ def test_cronjob_pod_spec_lives_under_job_template(tmp_path):
         """,
     )
     w("backup/overlays/staging/kustomization.yaml", "namespace: ops\nresources:\n  - ../../base\n")
-    graph = _graph_for(repo)
+    graph = build_graph(repo)
     node = graph.nodes["svc:ops/nightly-backup"]
     assert node.attrs["image"] == "backup:1"
     assert "POSTGRES_HOST" in node.attrs["env_vars"]
@@ -74,7 +54,7 @@ def test_init_container_dependencies_and_role(tmp_path):
     """An init container (e.g. a migration) carries real dependencies: its
     valueFrom secret ref must emit a REFERENCES edge, and it is tagged role=init."""
     repo = tmp_path / "r"
-    w = _writer(repo)
+    w = repo_writer(repo)
     w(
         "billing/base/api.yaml",
         """
@@ -107,7 +87,7 @@ def test_init_container_dependencies_and_role(tmp_path):
         """,
     )
     w("billing/overlays/staging/kustomization.yaml", "namespace: billing\nresources:\n  - ../../base\n")
-    graph = _graph_for(repo)
+    graph = build_graph(repo)
     node = graph.nodes["svc:billing/billing"]
     roles = {c["name"]: c["role"] for c in node.attrs["containers"]}
     assert roles == {
@@ -127,7 +107,7 @@ def test_init_container_dependencies_and_role(tmp_path):
 
 def test_probes_resources_and_bundle_attrs(tmp_path):
     repo = tmp_path / "r"
-    w = _writer(repo)
+    w = repo_writer(repo)
     w(
         "shop/base/api.yaml",
         """
@@ -157,7 +137,7 @@ def test_probes_resources_and_bundle_attrs(tmp_path):
         """,
     )
     w("shop/overlays/staging/kustomization.yaml", "namespace: shop\nresources:\n  - ../../base\n")
-    graph = _graph_for(repo)
+    graph = build_graph(repo)
     attrs = graph.nodes["svc:shop/shop"].attrs
     assert attrs["overlay"] == "shop"
     assert attrs["app_label"] == "shop"
@@ -177,7 +157,7 @@ def test_probes_resources_and_bundle_attrs(tmp_path):
 
 def test_mount_paths_on_reference_and_mounts_edges(tmp_path):
     repo = tmp_path / "r"
-    w = _writer(repo)
+    w = repo_writer(repo)
     w(
         "files/base/app.yaml",
         """
@@ -221,7 +201,7 @@ def test_mount_paths_on_reference_and_mounts_edges(tmp_path):
         """,
     )
     w("files/overlays/staging/kustomization.yaml", "namespace: files\nresources:\n  - ../../base\n")
-    graph = _graph_for(repo)
+    graph = build_graph(repo)
     refs = {e.dst_id: e for e in graph.edges if e.type == EdgeType.REFERENCES}
     assert refs["cm:files/files-config"].attrs["mount_paths"] == ["/etc/app"]
     assert refs["secret:files/files-tls"].attrs["mount_paths"] == ["/etc/tls"]

@@ -29,7 +29,7 @@ def parse_cluster_host(value: str) -> ClusterTarget | None:
 
     Accepts a bare host or a full URL. Returns ``None`` for external hosts.
     """
-    host = _extract_host(value)
+    host = extract_host(value)
     if host is None:
         return None
     m = _CLUSTER_DNS.match(host)
@@ -39,11 +39,11 @@ def parse_cluster_host(value: str) -> ClusterTarget | None:
 
 
 def is_cluster_internal(value: str) -> bool:
-    host = _extract_host(value)
+    host = extract_host(value)
     return host is not None and ".svc" in host
 
 
-def _extract_host(value: str) -> str | None:
+def extract_host(value: str) -> str | None:
     value = value.strip()
     if not value:
         return None

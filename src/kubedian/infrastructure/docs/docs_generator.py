@@ -10,10 +10,10 @@ from __future__ import annotations
 from collections import defaultdict
 from pathlib import Path
 
-from kubedian.infrastructure.mermaid import mermaid_renderer
-from kubedian.infrastructure.sanitize import assert_no_secret_values
 from kubedian.domain.entities.graph import Edge, EdgeType, Graph, Node, NodeType
 from kubedian.i18n import t
+from kubedian.infrastructure.mermaid import mermaid_renderer
+from kubedian.infrastructure.sanitize import assert_no_secret_values
 
 _EDGE_KEY = {
     EdgeType.HTTP_CALLS: "http_calls",
@@ -26,7 +26,6 @@ _EDGE_KEY = {
     EdgeType.DEPENDS_ON_CHART: "depends_on_chart",
     EdgeType.ROUTES_TO: "routes_to",
     EdgeType.ALLOWS_TO: "allows_to",
-    EdgeType.SELECTS: "selects",
     EdgeType.MOUNTS: "mounts",
     EdgeType.SCALES: "scales",
     EdgeType.RUNS_AS: "runs_as",
