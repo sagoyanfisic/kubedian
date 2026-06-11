@@ -256,8 +256,8 @@ def _dedup_edges(edges: list[Edge]) -> list[Edge]:
 
 
 def _merge_reference_attrs(target: dict, other: dict) -> None:
-    """Union ``keys``/``modes`` and merge ``env_map`` of two REFERENCES edges."""
-    for field_name in ("keys", "modes"):
+    """Union ``keys``/``modes``/``mount_paths`` and merge ``env_map`` of two REFERENCES edges."""
+    for field_name in ("keys", "modes", "mount_paths"):
         values = list(target.get(field_name) or []) + list(other.get(field_name) or [])
         if values:
             target[field_name] = list(dict.fromkeys(values))
@@ -324,7 +324,32 @@ def _workload_attrs(result: ExtractResult, dep: DeploymentView) -> dict:
         "env_vars": sorted(env_vars),
         "service_account": dep.service_account,
         "nodepool": dep.nodepool,
+        # Bundle membership: workloads sharing the overlay are siblings (api/worker/beat).
+        "overlay": result.overlay.service,
+        "app_label": dep.app_label,
+        "containers": _container_attrs(dep) or None,
     }
+
+
+def _container_attrs(dep: DeploymentView) -> list[dict]:
+    """Compact per-container facts (role, resources, probes, mount paths).
+
+    Empty/None fields are omitted to keep the node's JSON attrs small — this
+    detail is only serialized in full by the composition query, not node_dict.
+    """
+    out: list[dict] = []
+    for c in dep.containers:
+        entry: dict = {"name": c.name, "role": c.role}
+        if c.image:
+            entry["image"] = c.image
+        if c.resources:
+            entry["resources"] = c.resources
+        if c.probes:
+            entry["probes"] = c.probes
+        if c.volume_mounts:
+            entry["mounts"] = [path for _, path in c.volume_mounts]
+        out.append(entry)
+    return out
 
 
 def _overlay_attrs(result: ExtractResult) -> dict:
@@ -500,7 +525,11 @@ def _resolve_service_edges(
                         dep.resource.source_file, catalog=catalog,
                     )
             else:  # plain config — record the dependency on the configmap
-                _emit_reference(graph, node_id, NodeType.CONFIGMAP, "cm", ns, cm_name, env, dep.resource.source_file)
+                _emit_reference(
+                    graph, node_id, NodeType.CONFIGMAP, "cm", ns, cm_name, env,
+                    dep.resource.source_file,
+                    mount_paths=dep.configmap_mount_paths.get(cm_name),
+                )
         for secret_name in dep.secret_volumes:
             sv = secret_index.get(secret_name)
             # Store ONLY the key names and the Secret's own file location — never values.
@@ -510,6 +539,7 @@ def _resolve_service_edges(
             _emit_reference(
                 graph, node_id, NodeType.SECRET, "secret", ns, secret_name, env,
                 dep.resource.source_file, node_attrs=secret_attrs,
+                mount_paths=dep.secret_mount_paths.get(secret_name),
             )
 
     # 5. helmCharts -> explicit depends_on_chart (overlay-level -> primary node)
@@ -766,10 +796,12 @@ def _resolve_storage_edges(
     for dep, node_id in pairs:
         for claim in list(dep.pvc_volumes) + list(dep.volume_claim_templates):
             pvc_id = _ensure_storage_node(graph, ns, claim, None)
+            paths = dep.pvc_mount_paths.get(claim)
             graph.add_edge(Edge(
                 src_id=node_id, dst_id=pvc_id, type=EdgeType.MOUNTS, environment=env,
                 provenance=Provenance.EXPLICIT, signal=Signal.VOLUME_CLAIM,
                 source_file=dep.resource.source_file, source_locator=claim,
+                attrs={"mount_paths": list(paths)} if paths else {},
             ))
 
 
@@ -989,6 +1021,7 @@ def _emit_reference(
     signal: Signal = Signal.VOLUME_MOUNT,
     keys: list[str] | None = None,
     env_map: dict[str, str] | None = None,
+    mount_paths: tuple[str, ...] | None = None,
 ) -> None:
     """Record that a service mounts/consumes a ConfigMap/Secret as config (no values read).
 
@@ -1011,6 +1044,8 @@ def _emit_reference(
         edge_attrs["keys"] = list(dict.fromkeys(keys))
     if env_map:
         edge_attrs["env_map"] = dict(env_map)
+    if mount_paths:
+        edge_attrs["mount_paths"] = list(mount_paths)
     graph.add_edge(
         Edge(
             src_id=src_id,

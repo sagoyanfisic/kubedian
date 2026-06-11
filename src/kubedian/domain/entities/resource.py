@@ -60,6 +60,15 @@ class ContainerView:
     # env[].valueFrom.secretKeyRef / configMapKeyRef — names only, never values.
     secret_key_refs: tuple[EnvKeyRef, ...] = ()
     configmap_key_refs: tuple[EnvKeyRef, ...] = ()
+    # "main" | "init" | "sidecar" — init containers carry real dependencies
+    # (migrations talk to the DB) so they live in the same list, tagged.
+    role: str = "main"
+    # Raw requests/limits dict, e.g. {"requests": {"cpu": "100m"}, "limits": {...}}.
+    resources: dict[str, Any] | None = None
+    # Compact probe summaries: {"liveness": {"type": "http", "port": 8000, "path": "/health"}}.
+    probes: dict[str, dict[str, Any]] | None = None
+    # (volume name, mountPath) pairs from volumeMounts.
+    volume_mounts: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -85,6 +94,10 @@ class DeploymentView:
     # PersistentVolumeClaim names mounted, plus StatefulSet volumeClaimTemplates.
     pvc_volumes: tuple[str, ...] = ()
     volume_claim_templates: tuple[str, ...] = ()
+    # Source-object name -> container mountPaths, joined from volumes × volumeMounts.
+    secret_mount_paths: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    configmap_mount_paths: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    pvc_mount_paths: dict[str, tuple[str, ...]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
