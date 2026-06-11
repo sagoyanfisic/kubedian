@@ -30,6 +30,17 @@ from kubedian.domain.entities.graph import (
 )
 from kubedian.domain.entities.resource import DeploymentView, EnvKeyRef, K8sResource
 
+# Kinds the resolver turns into graph nodes/edges/attrs. Anything else is counted
+# into index_meta.ignored_kinds so nothing is *silently* dropped.
+HANDLED_KINDS: frozenset[str] = frozenset({
+    "Deployment", "StatefulSet", "DaemonSet", "Job", "CronJob",
+    "Service", "Ingress", "VirtualService", "Gateway", "NetworkPolicy",
+    "PersistentVolumeClaim", "HorizontalPodAutoscaler", "ServiceAccount",
+    "ConfigMap", "Secret", "Namespace",
+    "PodDisruptionBudget", "Role", "RoleBinding", "ClusterRole", "ClusterRoleBinding",
+    "ScaledObject",
+})
+
 
 @dataclass
 class _ServiceIndex:
@@ -141,6 +152,8 @@ def resolve(results: list[ExtractResult]) -> Graph:
         _resolve_storage_edges(graph, index, result, pairs, primary, env)
         _resolve_autoscaler_edges(graph, index, result, primary, env)
         _resolve_identity_edges(graph, index, result, pairs, primary, env)
+        _resolve_rbac_edges(graph, index, result, primary, env)
+        _resolve_pdb_attrs(graph, index, result, primary)
         _resolve_gateway_edges(graph, index, result, primary, env)
         _resolve_owner_edges(graph, index, result, primary, env)
 
@@ -157,6 +170,16 @@ def _register_services(graph: Graph, index: _ServiceIndex, result: ExtractResult
         if res.kind != "Service" or not res.name:
             continue
         rns = res.namespace or ns
+        spec = res.raw.get("spec") or {}
+        if spec.get("type") == "ExternalName" and spec.get("externalName"):
+            # An ExternalName Service is a DNS alias to an outside host: consumers
+            # resolving this name are really calling the external API, so alias the
+            # Service name to an external node. setdefault: never shadow a workload.
+            ext_id = _ensure_external_node(graph, str(spec["externalName"]))
+            graph.nodes[ext_id].attrs.setdefault("external_name_service", res.name)
+            index.by_alias.setdefault((rns, res.name), ext_id)
+            index.by_alias.setdefault((ns, res.name), ext_id)
+            continue
         target = index.by_alias.get((rns, res.name))
         if target is None:
             sel = (res.raw.get("spec") or {}).get("selector") or {}
@@ -482,7 +505,7 @@ def _resolve_service_edges(
                             Edge(
                                 src_id=node_id,
                                 dst_id=dst,
-                                type=EdgeType.HTTP_CALLS,
+                                type=_call_edge_type(graph, dst),
                                 environment=env,
                                 provenance=Provenance.EXPLICIT,
                                 signal=Signal.DNS_LITERAL,
@@ -819,10 +842,12 @@ def _ensure_storage_node(graph: Graph, ns: str, name: str, raw: dict | None) -> 
 def _resolve_autoscaler_edges(
     graph: Graph, index: _ServiceIndex, result: ExtractResult, node_id: str, env: Environment
 ) -> None:
-    """HorizontalPodAutoscaler becomes a node that SCALES its scaleTargetRef."""
+    """HorizontalPodAutoscaler and Keda ScaledObject become autoscaler nodes that
+    SCALE their scaleTargetRef. Keda trigger *types* are kept; trigger metadata is
+    dropped on purpose — it can carry hostnames/connection strings."""
     ns = graph.nodes[node_id].namespace or "default"
     for res in result.resources:
-        if res.kind != "HorizontalPodAutoscaler":
+        if res.kind not in ("HorizontalPodAutoscaler", "ScaledObject"):
             continue
         spec = res.raw.get("spec") or {}
         ref = spec.get("scaleTargetRef") or {}
@@ -831,18 +856,34 @@ def _resolve_autoscaler_edges(
             continue
         rns = res.namespace or ns
         hpa_id = f"hpa:{rns}/{res.name}"
-        graph.add_node(Node(
-            id=hpa_id, type=NodeType.AUTOSCALER, name=res.name, namespace=rns,
-            attrs={
+        if res.kind == "ScaledObject":
+            triggers = sorted({
+                str(t["type"])
+                for t in spec.get("triggers") or []
+                if isinstance(t, dict) and t.get("type")
+            })
+            attrs = {
+                "kind": "ScaledObject",
+                "min_replicas": spec.get("minReplicaCount"),
+                "max_replicas": spec.get("maxReplicaCount"),
+                "target_kind": ref.get("kind") or "Deployment",
+                "triggers": triggers,
+            }
+            signal = Signal.KEDA_SCALER
+        else:
+            attrs = {
                 "min_replicas": spec.get("minReplicas"),
                 "max_replicas": spec.get("maxReplicas"),
                 "target_kind": ref.get("kind"),
-            },
+            }
+            signal = Signal.HPA_TARGET
+        graph.add_node(Node(
+            id=hpa_id, type=NodeType.AUTOSCALER, name=res.name, namespace=rns, attrs=attrs,
         ))
         dst = _ensure_service_target(graph, index, ClusterTarget(service=str(target), namespace=rns))
         graph.add_edge(Edge(
             src_id=hpa_id, dst_id=dst, type=EdgeType.SCALES, environment=env,
-            provenance=Provenance.EXPLICIT, signal=Signal.HPA_TARGET,
+            provenance=Provenance.EXPLICIT, signal=signal,
             source_file=res.source_file, source_locator=str(target),
         ))
 
@@ -876,6 +917,84 @@ def _ensure_sa_node(graph: Graph, ns: str, name: str) -> str:
     node_id = f"sa:{ns}/{name}"
     graph.add_node(Node(id=node_id, type=NodeType.SERVICE_ACCOUNT, name=name, namespace=ns))
     return node_id
+
+
+def _resolve_rbac_edges(
+    graph: Graph, index: _ServiceIndex, result: ExtractResult, primary: str, env: Environment
+) -> None:
+    """Lightweight RBAC: a (Cluster)RoleBinding GRANTS its roleRef to each
+    ServiceAccount subject. Only names (plus a rules count for standalone roles)
+    are kept — never rule verbs/resources detail."""
+    ns = graph.nodes[primary].namespace or "default"
+    for res in result.resources:
+        if res.kind in ("Role", "ClusterRole") and res.name:
+            _ensure_role_node(
+                graph,
+                None if res.kind == "ClusterRole" else (res.namespace or ns),
+                res.name,
+                kind=res.kind,
+                rules_count=len(res.raw.get("rules") or []),
+            )
+        if res.kind not in ("RoleBinding", "ClusterRoleBinding"):
+            continue
+        ref = res.raw.get("roleRef") or {}
+        if not isinstance(ref, dict) or not ref.get("name"):
+            continue
+        binding_ns = res.namespace or ns
+        ref_kind = str(ref.get("kind") or "Role")
+        role_id = _ensure_role_node(
+            graph,
+            None if ref_kind == "ClusterRole" else binding_ns,
+            str(ref["name"]),
+            kind=ref_kind,
+        )
+        for subject in res.raw.get("subjects") or []:
+            if (
+                not isinstance(subject, dict)
+                or subject.get("kind") != "ServiceAccount"
+                or not subject.get("name")
+            ):
+                continue
+            sa_id = _ensure_sa_node(graph, str(subject.get("namespace") or binding_ns), str(subject["name"]))
+            graph.add_edge(Edge(
+                src_id=sa_id, dst_id=role_id, type=EdgeType.GRANTS, environment=env,
+                provenance=Provenance.EXPLICIT, signal=Signal.ROLE_BINDING,
+                source_file=res.source_file, source_locator=res.name,
+            ))
+
+
+def _ensure_role_node(
+    graph: Graph, ns: str | None, name: str, *, kind: str, rules_count: int | None = None
+) -> str:
+    node_id = f"role:{ns or 'cluster'}/{name}"
+    attrs: dict = {"kind": kind, "cluster_wide": ns is None}
+    if rules_count is not None:
+        attrs["rules_count"] = rules_count
+    graph.add_node(Node(id=node_id, type=NodeType.ROLE, name=name, namespace=ns, attrs=attrs))
+    return node_id
+
+
+def _resolve_pdb_attrs(
+    graph: Graph, index: _ServiceIndex, result: ExtractResult, primary: str
+) -> None:
+    """A PodDisruptionBudget protects the workload its selector matches: recorded
+    as attrs on that node (no edge — it's a property, not a dependency). Ambiguous
+    selectors (a shared bundle label) are skipped rather than guessed."""
+    ns = graph.nodes[primary].namespace or "default"
+    for res in result.resources:
+        if res.kind != "PodDisruptionBudget" or not res.name:
+            continue
+        spec = res.raw.get("spec") or {}
+        sel = (spec.get("selector") or {}).get("matchLabels") or {}
+        target = _match_selector(index, res.namespace or ns, {str(k): str(v) for k, v in sel.items()})
+        if target is None:
+            continue
+        graph.nodes[target].attrs["disruption_budget"] = {
+            "name": res.name,
+            "min_available": spec.get("minAvailable"),
+            "max_unavailable": spec.get("maxUnavailable"),
+            "source_file": res.source_file,
+        }
 
 
 def _resolve_gateway_edges(
@@ -964,7 +1083,7 @@ def _emit_configmap_call(
     else:
         provenance, confidence, attrs = Provenance.EXPLICIT, 1.0, {}
     graph.add_edge(Edge(
-        src_id=src_id, dst_id=dst_id, type=EdgeType.HTTP_CALLS, environment=env,
+        src_id=src_id, dst_id=dst_id, type=_call_edge_type(graph, dst_id), environment=env,
         provenance=provenance, signal=Signal.CONFIGMAP_URL, source_file=source_file,
         source_locator=f"{cm_name}.{env_key}", confidence=confidence, attrs=attrs,
     ))
@@ -1064,6 +1183,21 @@ def _emit_reference(
     )
 
 
+def _ensure_external_node(graph: Graph, host: str) -> str:
+    dst_id = f"ext:{host.replace('.', '-')}"
+    graph.add_node(Node(id=dst_id, type=NodeType.EXTERNAL_API, name=host, attrs={"host": host}))
+    return dst_id
+
+
+def _call_edge_type(graph: Graph, dst_id: str) -> EdgeType:
+    """An alias may resolve to an external node (ExternalName Service): calling
+    through it is calls_external, not an in-cluster http_calls."""
+    node = graph.nodes.get(dst_id)
+    if node is not None and node.type == NodeType.EXTERNAL_API:
+        return EdgeType.CALLS_EXTERNAL
+    return EdgeType.HTTP_CALLS
+
+
 def _emit_external(
     graph: Graph,
     src_id: str,
@@ -1076,9 +1210,7 @@ def _emit_external(
     from kubedian.application.heuristics.dns import _extract_host
 
     host = _extract_host(value) or value
-    slug = host.replace(".", "-")
-    dst_id = f"ext:{slug}"
-    graph.add_node(Node(id=dst_id, type=NodeType.EXTERNAL_API, name=host, attrs={"host": host}))
+    dst_id = _ensure_external_node(graph, host)
     graph.add_edge(
         Edge(
             src_id=src_id,

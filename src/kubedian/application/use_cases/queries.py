@@ -290,6 +290,9 @@ def status(reader: GraphReader) -> dict:
         "service_count": meta.service_count if meta else node_types.get("service", 0),
         "edge_count": meta.edge_count if meta else len(reader.edges()),
         "render_failures": meta.render_failures if meta else None,
+        # Kinds seen in manifests but not graphed — refreshed by full `index` only.
+        "ignored_kinds": (meta.ignored_kinds or {}) if meta else {},
+        "ignored_kind_count": sum((meta.ignored_kinds or {}).values()) if meta else 0,
         "node_types": dict(node_types),
         "edge_types": dict(edge_types),
     }

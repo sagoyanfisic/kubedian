@@ -44,6 +44,7 @@ _SHAPE = {
     NodeType.SERVICE_ACCOUNT: ("[/", "/]"),
     NodeType.JOB: ("[[", "]]"),
     NodeType.CRONJOB: ("[[", "]]"),
+    NodeType.ROLE: ("[/", "/]"),
 }
 
 _EDGE_LABEL_KEY = {
@@ -60,6 +61,7 @@ _EDGE_LABEL_KEY = {
     EdgeType.MOUNTS: "mounts",
     EdgeType.SCALES: "scales",
     EdgeType.RUNS_AS: "runs_as",
+    EdgeType.GRANTS: "grants",
     EdgeType.OWNS: "owns",
     EdgeType.DEPENDS_ON_CHART: "depends_on_chart",
     EdgeType.REFERENCES: "references",

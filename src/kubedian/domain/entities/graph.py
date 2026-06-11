@@ -30,6 +30,7 @@ class NodeType(StrEnum):
     SERVICE_ACCOUNT = "service_account"
     JOB = "job"  # one-off batch workload
     CRONJOB = "cronjob"  # scheduled batch workload
+    ROLE = "role"  # RBAC Role/ClusterRole (names + rule count only)
 
 
 class EdgeType(StrEnum):
@@ -52,6 +53,7 @@ class EdgeType(StrEnum):
     MOUNTS = "mounts"  # workload -> PersistentVolumeClaim
     SCALES = "scales"  # HorizontalPodAutoscaler -> workload
     RUNS_AS = "runs_as"  # workload -> ServiceAccount
+    GRANTS = "grants"  # ServiceAccount -> Role/ClusterRole (via RoleBinding)
     IN_NAMESPACE = "in_namespace"
 
 
@@ -74,7 +76,10 @@ class Signal(StrEnum):
     NETWORK_POLICY = "network_policy"
     VOLUME_CLAIM = "volume_claim"
     HPA_TARGET = "hpa_target"
+    KEDA_SCALER = "keda_scaledobject"
     SERVICE_ACCOUNT_REF = "service_account_ref"
+    ROLE_BINDING = "role_binding"
+    EXTERNAL_NAME = "external_name"  # Service of type ExternalName
     GATEWAY_BINDING = "gateway_binding"
     AUTH_ANNOTATION = "auth_annotation"
     OWNER_REF = "owner_ref"

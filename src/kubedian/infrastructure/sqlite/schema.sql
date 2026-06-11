@@ -35,7 +35,8 @@ CREATE TABLE IF NOT EXISTS index_meta (
     service_count     INTEGER,
     edge_count        INTEGER,
     render_failures   INTEGER,
-    generation        INTEGER NOT NULL DEFAULT 0  -- current mark-and-sweep generation
+    generation        INTEGER NOT NULL DEFAULT 0,  -- current mark-and-sweep generation
+    ignored_kinds     TEXT  -- JSON {kind: count} of kinds seen but not graphed (full index only)
 );
 
 CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(src_id, environment);

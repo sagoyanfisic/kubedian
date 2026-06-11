@@ -31,6 +31,9 @@ class IndexMeta:
     service_count: int
     edge_count: int
     render_failures: int
+    # kind -> count of rendered resources the resolver does not graph.
+    # Only refreshed by a full `index` (sync-envs doesn't own it).
+    ignored_kinds: dict[str, int] | None = None
 
 
 class GraphReader:
@@ -209,6 +212,8 @@ class GraphReader:
         row = self._conn.execute("SELECT * FROM index_meta WHERE id = 1").fetchone()
         if not row:
             return None
+        # Defensive: pre-migration DBs may lack the column.
+        ignored = row["ignored_kinds"] if "ignored_kinds" in row.keys() else None
         return IndexMeta(
             repo_path=row["repo_path"],
             indexed_at=row["indexed_at"],
@@ -216,6 +221,7 @@ class GraphReader:
             service_count=row["service_count"],
             edge_count=row["edge_count"],
             render_failures=row["render_failures"],
+            ignored_kinds=json.loads(ignored) if ignored else None,
         )
 
     def close(self) -> None:

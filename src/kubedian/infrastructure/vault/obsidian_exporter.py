@@ -25,6 +25,7 @@ _TAG = {
     NodeType.SERVICE_ACCOUNT: "serviceaccount",
     NodeType.JOB: "job",
     NodeType.CRONJOB: "cronjob",
+    NodeType.ROLE: "role",
 }
 
 _EDGE_FIELD = {
@@ -42,6 +43,7 @@ _EDGE_FIELD = {
     EdgeType.MOUNTS: "Mounts",
     EdgeType.SCALES: "Scales",
     EdgeType.RUNS_AS: "Runs as",
+    EdgeType.GRANTS: "Is granted role",
     EdgeType.OWNS: "Owns",
     EdgeType.REFERENCES: "Mounts config",
 }

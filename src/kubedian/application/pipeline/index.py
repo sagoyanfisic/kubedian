@@ -7,9 +7,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
+from collections import Counter
+
 from kubedian.application.pipeline.discover import discover_overlays
 from kubedian.application.pipeline.extract import ExtractResult, extract_overlay
-from kubedian.application.pipeline.resolve import resolve
+from kubedian.application.pipeline.resolve import HANDLED_KINDS, resolve
 from kubedian.domain.entities.graph import Environment, Graph
 from kubedian.domain.entities.resource import RenderMode
 from kubedian.infrastructure.kustomize.runner import kustomize_version
@@ -24,6 +26,8 @@ class IndexReport:
     render_failures: int = 0
     failed_overlays: list[str] = field(default_factory=list)
     documented_edges: int = 0
+    # kind -> count of rendered resources the resolver does not graph.
+    ignored_kinds: dict[str, int] = field(default_factory=dict)
     graph: Graph | None = None
 
 
@@ -53,6 +57,10 @@ def index_repo(
             on_overlay(i, len(overlays), overlay.service)
 
     graph = resolve(results)
+    report.ignored_kinds = dict(Counter(
+        res.kind for result in results for res in result.resources
+        if res.kind not in HANDLED_KINDS
+    ))
 
     if docs_dir is not None:
         from kubedian.application.pipeline.docs_ingest import ingest_docs
@@ -73,5 +81,6 @@ def index_repo(
         indexed_at=datetime.now(timezone.utc).isoformat(),
         kustomize_version=kustomize_version(),
         render_failures=report.render_failures,
+        ignored_kinds=report.ignored_kinds,
     )
     return report

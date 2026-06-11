@@ -30,6 +30,7 @@ _EDGE_KEY = {
     EdgeType.MOUNTS: "mounts",
     EdgeType.SCALES: "scales",
     EdgeType.RUNS_AS: "runs_as",
+    EdgeType.GRANTS: "grants",
     EdgeType.OWNS: "owns",
 }
 
