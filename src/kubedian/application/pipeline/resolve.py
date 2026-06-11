@@ -432,145 +432,211 @@ def _resolve_service_edges(
     primary: str,
     env: Environment,
 ) -> None:
+    """Config/env-derived edges — one helper per consumption mode."""
     secret_index = {s.name: s for s in result.secrets}
     configmap_index = _configmap_key_index(result)
+    service_name = result.overlay.service
 
     for dep, node_id in pairs:
         dep_ns = graph.nodes[node_id].namespace or "default"
         for container in dep.containers:
-            # 1. configmaps consumed via envFrom -> http_calls (heuristic if the
-            #    configmap is a shared service-discovery catalog). Either way the
-            #    workload also REFERENCES the configmap itself (key names only).
-            for cm_name in container.env_from_configmaps:
-                _emit_reference(
-                    graph, node_id, NodeType.CONFIGMAP, "cm", dep_ns, cm_name, env,
-                    dep.resource.source_file, signal=Signal.ENV_FROM,
-                    keys=configmap_index.get(cm_name),
-                )
-                targets = index.discovery_configmaps.get(cm_name)
-                if not targets:
-                    continue
-                catalog = cm_name in index.catalog_configmaps
-                for env_key, target in targets.items():
-                    dst = _ensure_service_target(graph, index, target)
-                    if dst == node_id:
-                        continue
-                    _emit_configmap_call(
-                        graph, node_id, dst, env, cm_name, env_key,
-                        dep.resource.source_file, catalog=catalog,
-                    )
+            _envfrom_configmap_edges(graph, index, node_id, dep_ns, container, env,
+                                     dep.resource.source_file, configmap_index)
+            _envkeyref_edges(graph, index, node_id, dep_ns, container, env,
+                             dep.resource.source_file, secret_index, service_name)
+            _env_literal_edges(graph, index, node_id, container, env, dep.resource.source_file)
+            _envfrom_secret_edges(graph, node_id, dep_ns, container, env,
+                                  secret_index, service_name)
+        _volume_config_edges(graph, index, dep, node_id, env, secret_index)
 
-            # 1b. single keys wired via env[].valueFrom.{secret,configMap}KeyRef:
-            #     one REFERENCES edge per referenced object carrying var->key names
-            #     (never values), plus the same key-name heuristics as envFrom.
-            for ref_name, refs in _group_key_refs(container.secret_key_refs).items():
-                secret = secret_index.get(ref_name)
-                secret_attrs = (
-                    {"keys": list(secret.key_names), "source_file": secret.source_file}
-                    if secret else None
-                )
-                _emit_reference(
-                    graph, node_id, NodeType.SECRET, "secret", dep_ns, ref_name, env,
-                    dep.resource.source_file, node_attrs=secret_attrs,
-                    signal=Signal.ENV_KEY_REF,
-                    keys=[r.key for r in refs],
-                    env_map={r.var: r.key for r in refs},
-                )
-                for r in refs:
-                    _emit_heuristic(graph, node_id, result.overlay.service, env, r.var,
-                                    dep.resource.source_file)
-            for ref_name, refs in _group_key_refs(container.configmap_key_refs).items():
-                _emit_reference(
-                    graph, node_id, NodeType.CONFIGMAP, "cm", dep_ns, ref_name, env,
-                    dep.resource.source_file, signal=Signal.ENV_KEY_REF,
-                    keys=[r.key for r in refs],
-                    env_map={r.var: r.key for r in refs},
-                )
-                targets = index.discovery_configmaps.get(ref_name) or {}
-                catalog = ref_name in index.catalog_configmaps
-                for r in refs:
-                    target = targets.get(r.key)
-                    if target is None:
-                        continue
-                    dst = _ensure_service_target(graph, index, target)
-                    if dst == node_id:
-                        continue
-                    _emit_configmap_call(
-                        graph, node_id, dst, env, ref_name, r.key,
-                        dep.resource.source_file, catalog=catalog,
-                    )
+    _helmchart_edges(graph, result, primary, env)
 
-            # 2. literal env values -> explicit edges
-            for key, value in container.env.items():
-                if parse_cluster_host(value) is not None:
-                    target = parse_cluster_host(value)
-                    dst = _ensure_service_target(graph, index, target)  # type: ignore[arg-type]
-                    if dst != node_id:
-                        graph.add_edge(
-                            Edge(
-                                src_id=node_id,
-                                dst_id=dst,
-                                type=_call_edge_type(graph, dst),
-                                environment=env,
-                                provenance=Provenance.EXPLICIT,
-                                signal=Signal.DNS_LITERAL,
-                                source_file=dep.resource.source_file,
-                                source_locator=key,
-                            )
-                        )
-                elif "://" in value and not is_cluster_internal(value):
-                    _emit_external(graph, node_id, env, key, value, dep.resource.source_file, Signal.ENV_LITERAL)
 
-            # 3. secret key-name heuristics
-            for secret_name in container.env_from_secrets:
-                secret = secret_index.get(secret_name)
-                if secret is None:
-                    continue
-                for key in secret.key_names:
-                    _emit_heuristic(graph, node_id, result.overlay.service, env, key, secret.source_file)
-                # Also record the secret itself with ALL its env-var names + file
-                # location (never values), so keys without a datastore match aren't lost.
-                _emit_reference(
-                    graph, node_id, NodeType.SECRET, "secret",
-                    dep_ns, secret_name, env,
-                    secret.source_file,
-                    node_attrs={"keys": list(secret.key_names), "source_file": secret.source_file},
-                    signal=Signal.ENV_FROM,
-                )
-
-        # 4. volume-mounted config (per deployment, not per container)
-        ns = graph.nodes[node_id].namespace or "default"
-        for cm_name in dep.configmap_volumes:
-            targets = index.discovery_configmaps.get(cm_name)
-            if targets:  # a service-discovery configmap mounted as a file
-                catalog = cm_name in index.catalog_configmaps
-                for env_key, target in targets.items():
-                    dst = _ensure_service_target(graph, index, target)
-                    if dst == node_id:
-                        continue
-                    _emit_configmap_call(
-                        graph, node_id, dst, env, cm_name, env_key,
-                        dep.resource.source_file, catalog=catalog,
-                    )
-            else:  # plain config — record the dependency on the configmap
-                _emit_reference(
-                    graph, node_id, NodeType.CONFIGMAP, "cm", ns, cm_name, env,
-                    dep.resource.source_file,
-                    mount_paths=dep.configmap_mount_paths.get(cm_name),
-                )
-        for secret_name in dep.secret_volumes:
-            sv = secret_index.get(secret_name)
-            # Store ONLY the key names and the Secret's own file location — never values.
-            secret_attrs = (
-                {"keys": list(sv.key_names), "source_file": sv.source_file} if sv else None
+def _envfrom_configmap_edges(
+    graph: Graph,
+    index: _ServiceIndex,
+    node_id: str,
+    dep_ns: str,
+    container,
+    env: Environment,
+    source_file: str,
+    configmap_index: dict[str, list[str]],
+) -> None:
+    """ConfigMaps consumed via envFrom -> http_calls (heuristic if the configmap
+    is a shared service-discovery catalog). Either way the workload also
+    REFERENCES the configmap itself (key names only)."""
+    for cm_name in container.env_from_configmaps:
+        _emit_reference(
+            graph, node_id, NodeType.CONFIGMAP, "cm", dep_ns, cm_name, env,
+            source_file, signal=Signal.ENV_FROM,
+            keys=configmap_index.get(cm_name),
+        )
+        targets = index.discovery_configmaps.get(cm_name)
+        if not targets:
+            continue
+        catalog = cm_name in index.catalog_configmaps
+        for env_key, target in targets.items():
+            dst = _ensure_service_target(graph, index, target)
+            if dst == node_id:
+                continue
+            _emit_configmap_call(
+                graph, node_id, dst, env, cm_name, env_key, source_file, catalog=catalog,
             )
+
+
+def _envkeyref_edges(
+    graph: Graph,
+    index: _ServiceIndex,
+    node_id: str,
+    dep_ns: str,
+    container,
+    env: Environment,
+    source_file: str,
+    secret_index: dict,
+    service_name: str,
+) -> None:
+    """Single keys wired via env[].valueFrom.{secret,configMap}KeyRef: one
+    REFERENCES edge per referenced object carrying var->key names (never values),
+    plus the same key-name heuristics as envFrom."""
+    for ref_name, refs in _group_key_refs(container.secret_key_refs).items():
+        secret = secret_index.get(ref_name)
+        secret_attrs = (
+            {"keys": list(secret.key_names), "source_file": secret.source_file}
+            if secret else None
+        )
+        _emit_reference(
+            graph, node_id, NodeType.SECRET, "secret", dep_ns, ref_name, env,
+            source_file, node_attrs=secret_attrs,
+            signal=Signal.ENV_KEY_REF,
+            keys=[r.key for r in refs],
+            env_map={r.var: r.key for r in refs},
+        )
+        for r in refs:
+            _emit_heuristic(graph, node_id, service_name, env, r.var, source_file)
+    for ref_name, refs in _group_key_refs(container.configmap_key_refs).items():
+        _emit_reference(
+            graph, node_id, NodeType.CONFIGMAP, "cm", dep_ns, ref_name, env,
+            source_file, signal=Signal.ENV_KEY_REF,
+            keys=[r.key for r in refs],
+            env_map={r.var: r.key for r in refs},
+        )
+        targets = index.discovery_configmaps.get(ref_name) or {}
+        catalog = ref_name in index.catalog_configmaps
+        for r in refs:
+            target = targets.get(r.key)
+            if target is None:
+                continue
+            dst = _ensure_service_target(graph, index, target)
+            if dst == node_id:
+                continue
+            _emit_configmap_call(
+                graph, node_id, dst, env, ref_name, r.key, source_file, catalog=catalog,
+            )
+
+
+def _env_literal_edges(
+    graph: Graph,
+    index: _ServiceIndex,
+    node_id: str,
+    container,
+    env: Environment,
+    source_file: str,
+) -> None:
+    """Literal env values -> explicit edges: a cluster DNS host is an http call
+    (or calls_external through an ExternalName alias); any other URL is external."""
+    for key, value in container.env.items():
+        target = parse_cluster_host(value)
+        if target is not None:
+            dst = _ensure_service_target(graph, index, target)
+            if dst != node_id:
+                graph.add_edge(
+                    Edge(
+                        src_id=node_id,
+                        dst_id=dst,
+                        type=_call_edge_type(graph, dst),
+                        environment=env,
+                        provenance=Provenance.EXPLICIT,
+                        signal=Signal.DNS_LITERAL,
+                        source_file=source_file,
+                        source_locator=key,
+                    )
+                )
+        elif "://" in value and not is_cluster_internal(value):
+            _emit_external(graph, node_id, env, key, value, source_file, Signal.ENV_LITERAL)
+
+
+def _envfrom_secret_edges(
+    graph: Graph,
+    node_id: str,
+    dep_ns: str,
+    container,
+    env: Environment,
+    secret_index: dict,
+    service_name: str,
+) -> None:
+    """Secrets consumed via envFrom: key-name heuristics (datastores/queues) plus
+    a REFERENCES edge recording ALL key names + file location (never values), so
+    keys without a datastore match aren't lost."""
+    for secret_name in container.env_from_secrets:
+        secret = secret_index.get(secret_name)
+        if secret is None:
+            continue
+        for key in secret.key_names:
+            _emit_heuristic(graph, node_id, service_name, env, key, secret.source_file)
+        _emit_reference(
+            graph, node_id, NodeType.SECRET, "secret",
+            dep_ns, secret_name, env,
+            secret.source_file,
+            node_attrs={"keys": list(secret.key_names), "source_file": secret.source_file},
+            signal=Signal.ENV_FROM,
+        )
+
+
+def _volume_config_edges(
+    graph: Graph,
+    index: _ServiceIndex,
+    dep: DeploymentView,
+    node_id: str,
+    env: Environment,
+    secret_index: dict,
+) -> None:
+    """Volume-mounted config (per deployment, not per container): a mounted
+    discovery configmap still yields call edges; plain config/secrets become
+    REFERENCES edges with their mount paths."""
+    ns = graph.nodes[node_id].namespace or "default"
+    for cm_name in dep.configmap_volumes:
+        targets = index.discovery_configmaps.get(cm_name)
+        if targets:  # a service-discovery configmap mounted as a file
+            catalog = cm_name in index.catalog_configmaps
+            for env_key, target in targets.items():
+                dst = _ensure_service_target(graph, index, target)
+                if dst == node_id:
+                    continue
+                _emit_configmap_call(
+                    graph, node_id, dst, env, cm_name, env_key,
+                    dep.resource.source_file, catalog=catalog,
+                )
+        else:  # plain config — record the dependency on the configmap
             _emit_reference(
-                graph, node_id, NodeType.SECRET, "secret", ns, secret_name, env,
-                dep.resource.source_file, node_attrs=secret_attrs,
-                mount_paths=dep.secret_mount_paths.get(secret_name),
+                graph, node_id, NodeType.CONFIGMAP, "cm", ns, cm_name, env,
+                dep.resource.source_file,
+                mount_paths=dep.configmap_mount_paths.get(cm_name),
             )
+    for secret_name in dep.secret_volumes:
+        sv = secret_index.get(secret_name)
+        # Store ONLY the key names and the Secret's own file location — never values.
+        secret_attrs = (
+            {"keys": list(sv.key_names), "source_file": sv.source_file} if sv else None
+        )
+        _emit_reference(
+            graph, node_id, NodeType.SECRET, "secret", ns, secret_name, env,
+            dep.resource.source_file, node_attrs=secret_attrs,
+            mount_paths=dep.secret_mount_paths.get(secret_name),
+        )
 
-    # 5. helmCharts -> explicit depends_on_chart (overlay-level -> primary node)
+
+def _helmchart_edges(graph: Graph, result: ExtractResult, primary: str, env: Environment) -> None:
+    """helmCharts -> explicit depends_on_chart (overlay-level -> primary node)."""
     for chart in result.helm_charts:
         chart_id = f"chart:{(chart.repo or '')}/{chart.name}@{chart.version or 'latest'}"
         graph.add_node(
