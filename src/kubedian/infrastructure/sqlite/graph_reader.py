@@ -64,12 +64,34 @@ class GraphReader:
     def nodes(self) -> list[Node]:
         return [self._node(r) for r in self._conn.execute("SELECT * FROM nodes")]
 
-    def search(self, query: str, limit: int = 25) -> list[Node]:
+    def search(self, query: str, limit: int = 25, namespace: str | None = None) -> list[Node]:
         like = f"%{query.lower()}%"
+        ns_clause, ns_params = (" AND namespace = ?", [namespace]) if namespace else ("", [])
         rows = self._conn.execute(
-            "SELECT * FROM nodes WHERE lower(name) LIKE ? OR lower(id) LIKE ? "
+            f"SELECT * FROM nodes WHERE (lower(name) LIKE ? OR lower(id) LIKE ?){ns_clause} "
             "ORDER BY (type='service') DESC, name LIMIT ?",
-            (like, like, limit),
+            (like, like, *ns_params, limit),
+        )
+        return [self._node(r) for r in rows]
+
+    def nodes_in_namespace(self, namespace: str) -> list[Node]:
+        rows = self._conn.execute(
+            "SELECT * FROM nodes WHERE namespace = ? ORDER BY type, name", (namespace,)
+        )
+        return [self._node(r) for r in rows]
+
+    def bundle_siblings(self, overlay: str, namespace: str, exclude_id: str) -> list[Node]:
+        """Other workloads rendered from the same overlay directory (an
+        api/worker/beat bundle) — identified by the `overlay` attr stamped on
+        every workload node."""
+        rows = self._conn.execute(
+            """
+            SELECT * FROM nodes
+            WHERE json_extract(attrs, '$.overlay') = ? AND namespace = ?
+              AND id != ? AND type IN ('service', 'job', 'cronjob')
+            ORDER BY name
+            """,
+            (overlay, namespace, exclude_id),
         )
         return [self._node(r) for r in rows]
 
