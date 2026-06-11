@@ -27,6 +27,18 @@ def register_service_tools(mcp) -> None:
         return queries.context(get_reader(), service, parse_env(environment))
 
     @mcp.tool(annotations=_RO)
+    def service_composition(service: str, environment: Optional[str] = "production") -> dict:
+        """Deep-dive complement to service_context: the COMPLETE technical
+        composition of one service in one call — full identity (per-container
+        roles/resources/probes, ports, env var names), bundle siblings (workloads
+        from the same overlay, e.g. api+worker+beat), config consumed (secrets/
+        configmaps with key NAMES only — never values), storage with mount paths,
+        autoscaling, ServiceAccount + granted RBAC roles, NetworkPolicy
+        connectivity in both directions (permissions, never calls), and routing
+        exposure with ports."""
+        return queries.service_composition(get_reader(), service, parse_env(environment))
+
+    @mcp.tool(annotations=_RO)
     def service_callers(service: str, environment: Optional[str] = "production", limit: int = 100) -> dict:
         """Which services call this one (incoming http_calls / routes)."""
         return queries.callers(get_reader(), service, parse_env(environment), limit)

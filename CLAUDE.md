@@ -24,16 +24,36 @@ alias, and an ambiguous shared-label selector resolves to nothing rather than gu
 
 Node types (`domain/entities/graph.py`): `service` (Deployment/StatefulSet/DaemonSet),
 `job` / `cronjob` (batch — excluded from service-only queries so migrations/backups
-don't pollute them), `database`/`cache`/`queue`, `external_api`, `configmap`/`secret`,
-`ingress_host`, `gateway`, `storage` (PVC), `autoscaler` (HPA), `service_account`,
-`helm_chart`, `namespace`.
+don't pollute them; a CronJob's pod spec is read from `spec.jobTemplate`), `database`/
+`cache`/`queue`, `external_api`, `configmap`/`secret`, `ingress_host`, `gateway`,
+`storage` (PVC), `autoscaler` (HPA **and** Keda ScaledObject — trigger *types* only,
+metadata may carry conn strings), `service_account`, `role` (RBAC, names + rules count
+only), `helm_chart`, `namespace`.
 
 Edge types: `http_calls`, `routes_to` (Istio VirtualService / Ingress / Gateway),
 `reads_from`/`writes_to`/`caches_in`/`queues_to`, `calls_external`, `allows_to`
 (NetworkPolicy — *permitted* connectivity, never a call: excluded from `trace`),
-`mounts` (→PVC), `scales` (HPA→workload), `runs_as` (→ServiceAccount),
-`depends_on_chart`, `references`, `owns`, `in_namespace`. `trace` follows `http_calls`
-**and** `routes_to` (so paths through a gateway are traced).
+`mounts` (→PVC, with `mount_paths`), `scales` (HPA/ScaledObject→workload), `runs_as`
+(→ServiceAccount), `grants` (ServiceAccount→role via RoleBinding), `depends_on_chart`,
+`references`, `owns`, `in_namespace`. `trace` follows `http_calls` **and** `routes_to`
+(so paths through a gateway are traced).
+
+**ExternalName Services alias to `ext:` nodes** — a consumer resolving that Service
+name is calling the external host, so the edge becomes `calls_external` (the alias
+never shadows a same-named workload). A **PodDisruptionBudget** is recorded as
+`disruption_budget` attrs on the workload its selector unambiguously matches (a shared
+bundle label is skipped, never guessed). Kinds the resolver does not graph are counted
+into `index_meta.ignored_kinds` (exposed by `status()`; refreshed by full `index` only)
+so nothing is *silently* ignored — `HANDLED_KINDS` in `resolve.py` is the registry.
+
+**Workload nodes carry their composition**: `containers` (per-container `role`
+main/init/sidecar — init containers' deps are real deps, e.g. migrations —, compact
+`resources`/`probes`, mount paths), `overlay`/`app_label` (bundle membership: workloads
+sharing the overlay are siblings), `env_vars`, `disruption_budget`. Full detail is only
+serialized by `service_composition` (one call: identity + bundle + config + storage +
+autoscaling + SA/RBAC + NetworkPolicy both directions + exposure); `node_dict` stays
+lean. `namespace_contents` inventories a namespace by type plus aggregated
+cross-namespace edges in/out.
 
 **Config is queryable.** A `references` edge records *how* a Secret/ConfigMap is
 consumed in `attrs`: `modes` (`env_from` / `env_key_ref` / `volume_mount`), `keys`
@@ -88,10 +108,12 @@ Source of truth is **SQLite** (`.kubedian/graph.db`). Every other surface reads 
 uv sync --extra mcp
 uv run pytest -q
 uv run kubedian index --repo <repo> --env staging
+uv run kubedian composition <svc> --json       # full composition: containers/bundle/config/storage/RBAC/netpol/exposure
+uv run kubedian namespace <ns> --json          # namespace inventory + cross-namespace edges in/out
 uv run kubedian secrets <svc> --json           # Secrets/ConfigMaps + key names + modes (never values)
 uv run kubedian ports <svc> --json             # containerPorts + Service port→targetPort + Ingress/VS exposure
-uv run kubedian find-key POSTGRES_HOST --json  # reverse lookup by env var / key name (--partial for substring)
-uv run kubedian find-port 8000 --json          # reverse lookup by port
+uv run kubedian find-key POSTGRES_HOST --json  # reverse lookup by env var / key name (--partial; --namespace)
+uv run kubedian find-port 8000 --json          # reverse lookup by port (--namespace)
 uv run kubedian export-vault --db .kubedian/graph.db --out ./vault
 uv run kubedian export-mermaid --db .kubedian/graph.db --focus <svc> --lang es
 uv run kubedian export-mermaid --db .kubedian/graph.db --include-isolated  # draw edge-less nodes too

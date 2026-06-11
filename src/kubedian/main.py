@@ -30,7 +30,11 @@ INSTRUCTIONS = (
     "`service_secrets` (which Secrets/ConfigMaps a service consumes — key NAMES only, "
     "values are never stored), `service_ports` (containerPorts, Service port->targetPort, "
     "Ingress/VirtualService exposure), and reverse lookups `find_key_usage` (who uses env "
-    "var/key X) and `find_port` (who listens on port N). Most tools take an `environment` "
+    "var/key X) and `find_port` (who listens on port N). For the full technical "
+    "composition of one service (containers with roles/resources/probes, bundle siblings, "
+    "config, storage, RBAC, NetworkPolicy connectivity, exposure) use `service_composition`; "
+    "for everything living in a namespace plus its cross-namespace relations use "
+    "`namespace_contents`. Most tools take an `environment` "
     "(development|staging|production|test, default production)."
 )
 

@@ -297,13 +297,14 @@ def status(
 def search(
     query: str = typer.Argument(..., help="Substring of a service / datastore / external name."),
     limit: int = typer.Option(25, "--limit", "-n"),
+    namespace: Optional[str] = typer.Option(None, "--namespace", help="Restrict to one namespace."),
     db: Optional[Path] = typer.Option(None, "--db"),
     repo: Optional[Path] = typer.Option(None, "--repo", "-r"),
     json: bool = typer.Option(False, "--json"),
 ) -> None:
     """Search for services / datastores / external APIs by name."""
     reader = _open_reader(db, repo)
-    _emit(queries.search(reader, query, limit), json)
+    _emit(queries.search(reader, query, limit, namespace=namespace), json)
     reader.close()
 
 
@@ -381,6 +382,34 @@ def impact(
 
 
 @app.command()
+def composition(
+    service: str = typer.Argument(..., help="Service name or node id."),
+    env: Optional[str] = typer.Option(None, "--env", "-e"),
+    db: Optional[Path] = typer.Option(None, "--db"),
+    repo: Optional[Path] = typer.Option(None, "--repo", "-r"),
+    json: bool = typer.Option(False, "--json"),
+) -> None:
+    """Full technical composition of a service in one call: identity (containers with roles/resources/probes, ports, env var names), bundle siblings, config (key NAMES only — never values), storage, autoscaling, ServiceAccount + RBAC roles, NetworkPolicy connectivity (both directions) and routing exposure."""
+    reader = _open_reader(db, repo)
+    _emit(queries.service_composition(reader, service, _parse_env(env)), json)
+    reader.close()
+
+
+@app.command()
+def namespace(
+    namespace: str = typer.Argument(..., help="Namespace name."),
+    env: Optional[str] = typer.Option(None, "--env", "-e"),
+    db: Optional[Path] = typer.Option(None, "--db"),
+    repo: Optional[Path] = typer.Option(None, "--repo", "-r"),
+    json: bool = typer.Option(False, "--json"),
+) -> None:
+    """Everything living in a namespace grouped by type, plus its cross-namespace relations (edges in/out aggregated by peer namespace and edge type)."""
+    reader = _open_reader(db, repo)
+    _emit(queries.namespace_contents(reader, namespace, _parse_env(env)), json)
+    reader.close()
+
+
+@app.command()
 def secrets(
     service: str = typer.Argument(..., help="Service name or node id."),
     env: Optional[str] = typer.Option(None, "--env", "-e"),
@@ -412,6 +441,7 @@ def ports(
 def find_key_cmd(
     query: str = typer.Argument(..., help="Env var or secret/configmap key name (e.g. POSTGRES_HOST)."),
     partial: bool = typer.Option(False, "--partial", help="Substring match instead of exact (case-insensitive either way)."),
+    namespace: Optional[str] = typer.Option(None, "--namespace", help="Restrict to workloads in one namespace."),
     env: Optional[str] = typer.Option(None, "--env", "-e"),
     db: Optional[Path] = typer.Option(None, "--db"),
     repo: Optional[Path] = typer.Option(None, "--repo", "-r"),
@@ -419,13 +449,14 @@ def find_key_cmd(
 ) -> None:
     """Reverse lookup: which workloads use an env var / secret key NAME, from which Secret/ConfigMap (names only, never values)."""
     reader = _open_reader(db, repo)
-    _emit(queries.find_key_usage(reader, query, _parse_env(env), partial=partial), json)
+    _emit(queries.find_key_usage(reader, query, _parse_env(env), partial=partial, namespace=namespace), json)
     reader.close()
 
 
 @app.command(name="find-port")
 def find_port_cmd(
     port: int = typer.Argument(..., help="Port number (e.g. 8000)."),
+    namespace: Optional[str] = typer.Option(None, "--namespace", help="Restrict to one namespace."),
     env: Optional[str] = typer.Option(None, "--env", "-e"),
     db: Optional[Path] = typer.Option(None, "--db"),
     repo: Optional[Path] = typer.Option(None, "--repo", "-r"),
@@ -433,7 +464,7 @@ def find_port_cmd(
 ) -> None:
     """Reverse lookup: which services listen on a port and which Ingress/VirtualService routes target it."""
     reader = _open_reader(db, repo)
-    _emit(queries.find_port(reader, port, _parse_env(env)), json)
+    _emit(queries.find_port(reader, port, _parse_env(env), namespace=namespace), json)
     reader.close()
 
 

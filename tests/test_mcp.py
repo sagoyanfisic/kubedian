@@ -103,3 +103,26 @@ async def test_mcp_config_tools(indexed_db):
 
         res = await client.call_tool("find_port", {"port": 8080})
         assert any(n["name"] == "service-b" for n in res.data["listeners"])
+
+
+async def test_mcp_composition_and_namespace_tools(indexed_db):
+    from kubedian.main import mcp
+
+    async with Client(mcp) as client:
+        names = {t.name for t in await client.list_tools()}
+        assert {"service_composition", "namespace_contents"} <= names
+
+        res = await client.call_tool(
+            "service_composition", {"service": "gateway", "environment": "staging"}
+        )
+        assert res.data["namespace"] == "ns-gw"
+        egress = {e["target"] for e in res.data["network_policies"]["egress_allowed_to"]}
+        assert "service-b" in egress
+        assert "ENC[" not in str(res.data)  # never values, only key names
+
+        res = await client.call_tool(
+            "namespace_contents", {"namespace": "ns-b", "environment": "staging"}
+        )
+        assert "service" in res.data["counts"]
+        incoming = {e["peer_namespace"] for e in res.data["cross_namespace"]["incoming"]}
+        assert "ns-a" in incoming

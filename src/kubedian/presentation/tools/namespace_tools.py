@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Optional
 
+from kubedian.application.use_cases import queries
 from kubedian.application.use_cases.queries import node_dict
 from kubedian.domain.entities.graph import EdgeType, NodeType
 from kubedian.presentation.tools.dependencies import get_reader, parse_env
@@ -52,6 +53,14 @@ def register_namespace_tools(mcp) -> None:
             ],
             "cross_namespace_calls": dict(cross),
         }
+
+    @mcp.tool(annotations=_RO)
+    def namespace_contents(namespace: str, environment: Optional[str] = "production") -> dict:
+        """Everything that lives in a namespace, grouped by node type (services,
+        jobs, secrets/configmaps, PVCs, HPAs, service accounts, roles…), plus an
+        aggregate of its cross-namespace relations: which namespaces it calls /
+        is called from, by edge type, with example edges."""
+        return queries.namespace_contents(get_reader(), namespace, parse_env(environment))
 
     @mcp.tool(annotations=_RO)
     def namespace_context(namespace: str, environment: Optional[str] = "production") -> dict:
