@@ -30,11 +30,14 @@ class NodeType(StrEnum):
     SERVICE_ACCOUNT = "service_account"
     JOB = "job"  # one-off batch workload
     CRONJOB = "cronjob"  # scheduled batch workload
+    ROLE = "role"  # RBAC Role/ClusterRole (names + rule count only)
 
 
 class EdgeType(StrEnum):
     HTTP_CALLS = "http_calls"
     READS_FROM = "reads_from"
+    # Reserved: part of the documented model, but no heuristic emits it yet
+    # (read/write can't be told apart from a key name alone).
     WRITES_TO = "writes_to"
     CACHES_IN = "caches_in"
     QUEUES_TO = "queues_to"
@@ -48,10 +51,10 @@ class EdgeType(StrEnum):
     DEPENDS_ON_CHART = "depends_on_chart"
     REFERENCES = "references"
     OWNS = "owns"
-    SELECTS = "selects"
     MOUNTS = "mounts"  # workload -> PersistentVolumeClaim
     SCALES = "scales"  # HorizontalPodAutoscaler -> workload
     RUNS_AS = "runs_as"  # workload -> ServiceAccount
+    GRANTS = "grants"  # ServiceAccount -> Role/ClusterRole (via RoleBinding)
     IN_NAMESPACE = "in_namespace"
 
 
@@ -74,13 +77,15 @@ class Signal(StrEnum):
     NETWORK_POLICY = "network_policy"
     VOLUME_CLAIM = "volume_claim"
     HPA_TARGET = "hpa_target"
+    KEDA_SCALER = "keda_scaledobject"
     SERVICE_ACCOUNT_REF = "service_account_ref"
+    ROLE_BINDING = "role_binding"
     GATEWAY_BINDING = "gateway_binding"
-    AUTH_ANNOTATION = "auth_annotation"
     OWNER_REF = "owner_ref"
-    SELECTOR = "selector"
     NAMESPACE = "namespace"
     VOLUME_MOUNT = "volume_mount"
+    ENV_FROM = "env_from"  # whole Secret/ConfigMap injected via envFrom
+    ENV_KEY_REF = "env_key_ref"  # single key via env[].valueFrom.{secret,configMap}KeyRef
     DOC_MERMAID = "doc_mermaid"  # parsed from a Mermaid diagram in the docs
 
 
@@ -114,7 +119,15 @@ class Edge(BaseModel):
 
     @property
     def key(self) -> tuple:
-        """Dedup identity: same logical edge in the same environment."""
+        """Dedup identity: same logical edge in the same environment.
+
+        Deliberately EXCLUDES ``source_locator`` (unlike SQLite's UNIQUE, which
+        includes it): edges discovered through several locators are merged
+        in-memory into one edge whose ``attrs["locators"]`` lists them all, and
+        only that merged edge reaches the store. ``sync-envs`` stays consistent
+        because it sweeps old-generation rows in the same transaction, so a
+        change of the representative locator can never leave duplicate rows.
+        """
         return (self.src_id, self.dst_id, self.type, self.environment)
 
 

@@ -13,11 +13,14 @@ _SCHEMA = files("kubedian.infrastructure.sqlite").joinpath("schema.sql").read_te
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
-    """Idempotently add the ``generation`` columns to DBs created before they existed."""
+    """Idempotently add columns to DBs created before they existed."""
     for table in ("nodes", "edges", "index_meta"):
         cols = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
         if "generation" not in cols:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN generation INTEGER NOT NULL DEFAULT 0")
+    meta_cols = {row["name"] for row in conn.execute("PRAGMA table_info(index_meta)")}
+    if "ignored_kinds" not in meta_cols:
+        conn.execute("ALTER TABLE index_meta ADD COLUMN ignored_kinds TEXT")
 
 
 def connect(db_path: Path) -> sqlite3.Connection:
@@ -37,6 +40,7 @@ def write_graph(
     kustomize_version: str | None,
     render_failures: int,
     generation: int = 1,
+    ignored_kinds: dict[str, int] | None = None,
 ) -> None:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     if db_path.exists():
@@ -78,7 +82,8 @@ def write_graph(
             conn.execute(
                 "INSERT OR REPLACE INTO index_meta"
                 "(id, repo_path, indexed_at, kustomize_version, service_count, "
-                " edge_count, render_failures, generation) VALUES (1, ?, ?, ?, ?, ?, ?, ?)",
+                " edge_count, render_failures, generation, ignored_kinds) "
+                "VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     repo_path,
                     indexed_at,
@@ -87,6 +92,7 @@ def write_graph(
                     len(graph.edges),
                     render_failures,
                     generation,
+                    json.dumps(ignored_kinds) if ignored_kinds else None,
                 ),
             )
     finally:

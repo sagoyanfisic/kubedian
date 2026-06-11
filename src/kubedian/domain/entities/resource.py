@@ -39,12 +39,36 @@ class K8sResource:
 
 
 @dataclass(frozen=True)
+class EnvKeyRef:
+    """One env var wired to a single Secret/ConfigMap key via ``valueFrom``.
+
+    Carries only NAMES (env var, referenced object, key) — never the value.
+    """
+
+    var: str  # env var name inside the container
+    ref: str  # name of the referenced Secret/ConfigMap
+    key: str  # key inside the referenced object
+
+
+@dataclass(frozen=True)
 class ContainerView:
     name: str
     image: str | None
     env: dict[str, str]  # only literal values (valueFrom is captured separately)
     env_from_secrets: list[str]
     env_from_configmaps: list[str]
+    # env[].valueFrom.secretKeyRef / configMapKeyRef — names only, never values.
+    secret_key_refs: tuple[EnvKeyRef, ...] = ()
+    configmap_key_refs: tuple[EnvKeyRef, ...] = ()
+    # "main" | "init" | "sidecar" — init containers carry real dependencies
+    # (migrations talk to the DB) so they live in the same list, tagged.
+    role: str = "main"
+    # Raw requests/limits dict, e.g. {"requests": {"cpu": "100m"}, "limits": {...}}.
+    resources: dict[str, Any] | None = None
+    # Compact probe summaries: {"liveness": {"type": "http", "port": 8000, "path": "/health"}}.
+    probes: dict[str, dict[str, Any]] | None = None
+    # (volume name, mountPath) pairs from volumeMounts.
+    volume_mounts: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -61,6 +85,8 @@ class DeploymentView:
     workload_kind: str = "Deployment"
     replicas: int | None = None
     ports: tuple[int, ...] = ()
+    # containerPort name -> number, for resolving Services' named targetPorts.
+    named_ports: dict[str, int] = field(default_factory=dict)
     service_account: str | None = None
     # Node pool the workload is scheduled onto, from the `purpose` node label
     # (nodeSelector / required nodeAffinity). None when the workload doesn't pin a pool.
@@ -68,6 +94,10 @@ class DeploymentView:
     # PersistentVolumeClaim names mounted, plus StatefulSet volumeClaimTemplates.
     pvc_volumes: tuple[str, ...] = ()
     volume_claim_templates: tuple[str, ...] = ()
+    # Source-object name -> container mountPaths, joined from volumes × volumeMounts.
+    secret_mount_paths: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    configmap_mount_paths: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    pvc_mount_paths: dict[str, tuple[str, ...]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

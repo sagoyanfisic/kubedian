@@ -16,7 +16,12 @@ from collections import Counter
 from dataclasses import dataclass, field
 
 from kubedian.application.heuristics import env_key_rules
-from kubedian.application.heuristics.dns import ClusterTarget, is_cluster_internal, parse_cluster_host
+from kubedian.application.heuristics.dns import (
+    ClusterTarget,
+    extract_host,
+    is_cluster_internal,
+    parse_cluster_host,
+)
 from kubedian.application.pipeline.extract import ExtractResult
 from kubedian.domain.entities.graph import (
     Edge,
@@ -28,7 +33,18 @@ from kubedian.domain.entities.graph import (
     Provenance,
     Signal,
 )
-from kubedian.domain.entities.resource import DeploymentView, K8sResource
+from kubedian.domain.entities.resource import DeploymentView, EnvKeyRef, K8sResource
+
+# Kinds the resolver turns into graph nodes/edges/attrs. Anything else is counted
+# into index_meta.ignored_kinds so nothing is *silently* dropped.
+HANDLED_KINDS: frozenset[str] = frozenset({
+    "Deployment", "StatefulSet", "DaemonSet", "Job", "CronJob",
+    "Service", "Ingress", "VirtualService", "Gateway", "NetworkPolicy",
+    "PersistentVolumeClaim", "HorizontalPodAutoscaler", "ServiceAccount",
+    "ConfigMap", "Secret", "Namespace",
+    "PodDisruptionBudget", "Role", "RoleBinding", "ClusterRole", "ClusterRoleBinding",
+    "ScaledObject",
+})
 
 
 @dataclass
@@ -141,6 +157,8 @@ def resolve(results: list[ExtractResult]) -> Graph:
         _resolve_storage_edges(graph, index, result, pairs, primary, env)
         _resolve_autoscaler_edges(graph, index, result, primary, env)
         _resolve_identity_edges(graph, index, result, pairs, primary, env)
+        _resolve_rbac_edges(graph, index, result, primary, env)
+        _resolve_pdb_attrs(graph, index, result, primary)
         _resolve_gateway_edges(graph, index, result, primary, env)
         _resolve_owner_edges(graph, index, result, primary, env)
 
@@ -157,6 +175,16 @@ def _register_services(graph: Graph, index: _ServiceIndex, result: ExtractResult
         if res.kind != "Service" or not res.name:
             continue
         rns = res.namespace or ns
+        spec = res.raw.get("spec") or {}
+        if spec.get("type") == "ExternalName" and spec.get("externalName"):
+            # An ExternalName Service is a DNS alias to an outside host: consumers
+            # resolving this name are really calling the external API, so alias the
+            # Service name to an external node. setdefault: never shadow a workload.
+            ext_id = _ensure_external_node(graph, str(spec["externalName"]))
+            graph.nodes[ext_id].attrs.setdefault("external_name_service", res.name)
+            index.by_alias.setdefault((rns, res.name), ext_id)
+            index.by_alias.setdefault((ns, res.name), ext_id)
+            continue
         target = index.by_alias.get((rns, res.name))
         if target is None:
             sel = (res.raw.get("spec") or {}).get("selector") or {}
@@ -168,10 +196,21 @@ def _register_services(graph: Graph, index: _ServiceIndex, result: ExtractResult
         index.by_alias.setdefault((ns, res.name), target)
         # Many workloads omit containerPort; the Service declares the real port.
         node = graph.nodes.get(target)
-        if node is not None and not node.attrs.get("ports"):
-            sp = _service_ports(res.raw)
-            if sp:
-                node.attrs["ports"] = sp
+        if node is not None:
+            if not node.attrs.get("ports"):
+                sp = _service_ports(res.raw)
+                if sp:
+                    node.attrs["ports"] = sp
+            # Several Services may front the same workload (e.g. an edge proxy
+            # selecting another service's pods) — keep every distinct wiring,
+            # tagged with the Service that declares it.
+            pm = _service_port_map(res.raw, node.attrs.get("named_ports"))
+            if pm:
+                existing = node.attrs.setdefault("port_map", [])
+                for entry in pm:
+                    entry["service"] = res.name
+                    if entry not in existing:
+                        existing.append(entry)
         nodes.append(target)
     return nodes
 
@@ -187,6 +226,29 @@ def _service_ports(raw: dict) -> list[int]:
         if isinstance(val, int):
             ports.append(val)
     return list(dict.fromkeys(ports))
+
+
+def _service_port_map(raw: dict, named_ports: dict | None) -> list[dict]:
+    """The Service's declared port wiring, one entry per spec.ports[] item.
+
+    ``target_port`` is the resolved container port: a named targetPort is looked
+    up in the workload's named containerPorts; an absent targetPort defaults to
+    ``port`` (Kubernetes' own default).
+    """
+    entries: list[dict] = []
+    for p in (raw.get("spec") or {}).get("ports") or []:
+        if not isinstance(p, dict) or not isinstance(p.get("port"), int):
+            continue
+        target = p.get("targetPort", p["port"])
+        if isinstance(target, str):
+            target = (named_ports or {}).get(target, target)
+        entries.append({
+            "name": p.get("name"),
+            "port": p["port"],
+            "target_port": target,
+            "protocol": p.get("protocol") or "TCP",
+        })
+    return entries
 
 
 def _dedup_edges(edges: list[Edge]) -> list[Edge]:
@@ -205,13 +267,31 @@ def _dedup_edges(edges: list[Edge]) -> list[Edge]:
             locators.append(existing.source_locator)
         if edge.source_locator and edge.source_locator not in locators:
             locators.append(edge.source_locator)
+        if edge.type == EdgeType.REFERENCES:
+            # The same Secret/ConfigMap may be consumed through several modes
+            # (envFrom + valueFrom + volume). Edge.key collapses them into one
+            # edge, so union the consumption facts instead of dropping them.
+            _merge_reference_attrs(existing.attrs, edge.attrs)
         # prefer explicit provenance / higher confidence
         if (existing.provenance != Provenance.EXPLICIT and edge.provenance == Provenance.EXPLICIT) or (
             edge.confidence > existing.confidence
         ):
             edge.attrs["locators"] = locators
+            if edge.type == EdgeType.REFERENCES:
+                _merge_reference_attrs(edge.attrs, existing.attrs)
             merged[key] = edge
     return list(merged.values())
+
+
+def _merge_reference_attrs(target: dict, other: dict) -> None:
+    """Union ``keys``/``modes``/``mount_paths`` and merge ``env_map`` of two REFERENCES edges."""
+    for field_name in ("keys", "modes", "mount_paths"):
+        values = list(target.get(field_name) or []) + list(other.get(field_name) or [])
+        if values:
+            target[field_name] = list(dict.fromkeys(values))
+    env_map = {**(other.get("env_map") or {}), **(target.get("env_map") or {})}
+    if env_map:
+        target["env_map"] = env_map
 
 
 # --------------------------------------------------------------------------- #
@@ -255,6 +335,12 @@ def _node_type_for(workload_kind: str) -> NodeType:
 def _workload_attrs(result: ExtractResult, dep: DeploymentView) -> dict:
     """Per-workload facts kept on its service node."""
     image = next((c.image for c in dep.containers if c.image), None)
+    # Env var NAMES only (literals + valueFrom targets) — values are never stored.
+    env_vars: set[str] = set()
+    for c in dep.containers:
+        env_vars.update(c.env.keys())
+        env_vars.update(r.var for r in c.secret_key_refs)
+        env_vars.update(r.var for r in c.configmap_key_refs)
     return {
         "render_mode": result.render_mode.value,
         "image": image,
@@ -262,9 +348,36 @@ def _workload_attrs(result: ExtractResult, dep: DeploymentView) -> dict:
         "workload_kind": dep.workload_kind,
         "replicas": dep.replicas,
         "ports": list(dep.ports),
+        "named_ports": dict(dep.named_ports) or None,
+        "env_vars": sorted(env_vars),
         "service_account": dep.service_account,
         "nodepool": dep.nodepool,
+        # Bundle membership: workloads sharing the overlay are siblings (api/worker/beat).
+        "overlay": result.overlay.service,
+        "app_label": dep.app_label,
+        "containers": _container_attrs(dep) or None,
     }
+
+
+def _container_attrs(dep: DeploymentView) -> list[dict]:
+    """Compact per-container facts (role, resources, probes, mount paths).
+
+    Empty/None fields are omitted to keep the node's JSON attrs small — this
+    detail is only serialized in full by the composition query, not node_dict.
+    """
+    out: list[dict] = []
+    for c in dep.containers:
+        entry: dict = {"name": c.name, "role": c.role}
+        if c.image:
+            entry["image"] = c.image
+        if c.resources:
+            entry["resources"] = c.resources
+        if c.probes:
+            entry["probes"] = c.probes
+        if c.volume_mounts:
+            entry["mounts"] = [path for _, path in c.volume_mounts]
+        out.append(entry)
+    return out
 
 
 def _overlay_attrs(result: ExtractResult) -> dict:
@@ -291,6 +404,26 @@ def _collect_discovery_configmaps(index: _ServiceIndex, result: ExtractResult) -
 # --------------------------------------------------------------------------- #
 # Pass 2 helpers
 # --------------------------------------------------------------------------- #
+def _configmap_key_index(result: ExtractResult) -> dict[str, list[str]]:
+    """ConfigMap name -> its data key names (names only, values are never kept)."""
+    out: dict[str, list[str]] = {}
+    for res in result.resources:
+        if res.kind != "ConfigMap" or not res.name:
+            continue
+        keys = list((res.raw.get("data") or {}).keys()) + list((res.raw.get("binaryData") or {}).keys())
+        if keys:
+            out[res.name] = [str(k) for k in keys]
+    return out
+
+
+def _group_key_refs(refs: tuple[EnvKeyRef, ...]) -> dict[str, list[EnvKeyRef]]:
+    """Group a container's valueFrom refs by referenced Secret/ConfigMap name."""
+    grouped: dict[str, list[EnvKeyRef]] = {}
+    for r in refs:
+        grouped.setdefault(r.ref, []).append(r)
+    return grouped
+
+
 def _resolve_service_edges(
     graph: Graph,
     index: _ServiceIndex,
@@ -299,92 +432,211 @@ def _resolve_service_edges(
     primary: str,
     env: Environment,
 ) -> None:
+    """Config/env-derived edges — one helper per consumption mode."""
     secret_index = {s.name: s for s in result.secrets}
+    configmap_index = _configmap_key_index(result)
+    service_name = result.overlay.service
 
     for dep, node_id in pairs:
+        dep_ns = graph.nodes[node_id].namespace or "default"
         for container in dep.containers:
-            # 1. configmaps consumed via envFrom -> http_calls (heuristic if the
-            #    configmap is a shared service-discovery catalog).
-            for cm_name in container.env_from_configmaps:
-                targets = index.discovery_configmaps.get(cm_name)
-                if not targets:
-                    continue
-                catalog = cm_name in index.catalog_configmaps
-                for env_key, target in targets.items():
-                    dst = _ensure_service_target(graph, index, target)
-                    if dst == node_id:
-                        continue
-                    _emit_configmap_call(
-                        graph, node_id, dst, env, cm_name, env_key,
-                        dep.resource.source_file, catalog=catalog,
+            _envfrom_configmap_edges(graph, index, node_id, dep_ns, container, env,
+                                     dep.resource.source_file, configmap_index)
+            _envkeyref_edges(graph, index, node_id, dep_ns, container, env,
+                             dep.resource.source_file, secret_index, service_name)
+            _env_literal_edges(graph, index, node_id, container, env, dep.resource.source_file)
+            _envfrom_secret_edges(graph, node_id, dep_ns, container, env,
+                                  secret_index, service_name)
+        _volume_config_edges(graph, index, dep, node_id, env, secret_index)
+
+    _helmchart_edges(graph, result, primary, env)
+
+
+def _envfrom_configmap_edges(
+    graph: Graph,
+    index: _ServiceIndex,
+    node_id: str,
+    dep_ns: str,
+    container,
+    env: Environment,
+    source_file: str,
+    configmap_index: dict[str, list[str]],
+) -> None:
+    """ConfigMaps consumed via envFrom -> http_calls (heuristic if the configmap
+    is a shared service-discovery catalog). Either way the workload also
+    REFERENCES the configmap itself (key names only)."""
+    for cm_name in container.env_from_configmaps:
+        _emit_reference(
+            graph, node_id, NodeType.CONFIGMAP, "cm", dep_ns, cm_name, env,
+            source_file, signal=Signal.ENV_FROM,
+            keys=configmap_index.get(cm_name),
+        )
+        targets = index.discovery_configmaps.get(cm_name)
+        if not targets:
+            continue
+        catalog = cm_name in index.catalog_configmaps
+        for env_key, target in targets.items():
+            dst = _ensure_service_target(graph, index, target)
+            if dst == node_id:
+                continue
+            _emit_configmap_call(
+                graph, node_id, dst, env, cm_name, env_key, source_file, catalog=catalog,
+            )
+
+
+def _envkeyref_edges(
+    graph: Graph,
+    index: _ServiceIndex,
+    node_id: str,
+    dep_ns: str,
+    container,
+    env: Environment,
+    source_file: str,
+    secret_index: dict,
+    service_name: str,
+) -> None:
+    """Single keys wired via env[].valueFrom.{secret,configMap}KeyRef: one
+    REFERENCES edge per referenced object carrying var->key names (never values),
+    plus the same key-name heuristics as envFrom."""
+    for ref_name, refs in _group_key_refs(container.secret_key_refs).items():
+        secret = secret_index.get(ref_name)
+        secret_attrs = (
+            {"keys": list(secret.key_names), "source_file": secret.source_file}
+            if secret else None
+        )
+        _emit_reference(
+            graph, node_id, NodeType.SECRET, "secret", dep_ns, ref_name, env,
+            source_file, node_attrs=secret_attrs,
+            signal=Signal.ENV_KEY_REF,
+            keys=[r.key for r in refs],
+            env_map={r.var: r.key for r in refs},
+        )
+        for r in refs:
+            _emit_heuristic(graph, node_id, service_name, env, r.var, source_file)
+    for ref_name, refs in _group_key_refs(container.configmap_key_refs).items():
+        _emit_reference(
+            graph, node_id, NodeType.CONFIGMAP, "cm", dep_ns, ref_name, env,
+            source_file, signal=Signal.ENV_KEY_REF,
+            keys=[r.key for r in refs],
+            env_map={r.var: r.key for r in refs},
+        )
+        targets = index.discovery_configmaps.get(ref_name) or {}
+        catalog = ref_name in index.catalog_configmaps
+        for r in refs:
+            target = targets.get(r.key)
+            if target is None:
+                continue
+            dst = _ensure_service_target(graph, index, target)
+            if dst == node_id:
+                continue
+            _emit_configmap_call(
+                graph, node_id, dst, env, ref_name, r.key, source_file, catalog=catalog,
+            )
+
+
+def _env_literal_edges(
+    graph: Graph,
+    index: _ServiceIndex,
+    node_id: str,
+    container,
+    env: Environment,
+    source_file: str,
+) -> None:
+    """Literal env values -> explicit edges: a cluster DNS host is an http call
+    (or calls_external through an ExternalName alias); any other URL is external."""
+    for key, value in container.env.items():
+        target = parse_cluster_host(value)
+        if target is not None:
+            dst = _ensure_service_target(graph, index, target)
+            if dst != node_id:
+                graph.add_edge(
+                    Edge(
+                        src_id=node_id,
+                        dst_id=dst,
+                        type=_call_edge_type(graph, dst),
+                        environment=env,
+                        provenance=Provenance.EXPLICIT,
+                        signal=Signal.DNS_LITERAL,
+                        source_file=source_file,
+                        source_locator=key,
                     )
-
-            # 2. literal env values -> explicit edges
-            for key, value in container.env.items():
-                if parse_cluster_host(value) is not None:
-                    target = parse_cluster_host(value)
-                    dst = _ensure_service_target(graph, index, target)  # type: ignore[arg-type]
-                    if dst != node_id:
-                        graph.add_edge(
-                            Edge(
-                                src_id=node_id,
-                                dst_id=dst,
-                                type=EdgeType.HTTP_CALLS,
-                                environment=env,
-                                provenance=Provenance.EXPLICIT,
-                                signal=Signal.DNS_LITERAL,
-                                source_file=dep.resource.source_file,
-                                source_locator=key,
-                            )
-                        )
-                elif "://" in value and not is_cluster_internal(value):
-                    _emit_external(graph, node_id, env, key, value, dep.resource.source_file, Signal.ENV_LITERAL)
-
-            # 3. secret key-name heuristics
-            for secret_name in container.env_from_secrets:
-                secret = secret_index.get(secret_name)
-                if secret is None:
-                    continue
-                for key in secret.key_names:
-                    _emit_heuristic(graph, node_id, result.overlay.service, env, key, secret.source_file)
-                # Also record the secret itself with ALL its env-var names + file
-                # location (never values), so keys without a datastore match aren't lost.
-                _emit_reference(
-                    graph, node_id, NodeType.SECRET, "secret",
-                    graph.nodes[node_id].namespace or "default", secret_name, env,
-                    secret.source_file,
-                    node_attrs={"keys": list(secret.key_names), "source_file": secret.source_file},
-                    signal=Signal.SECRET_KEY_NAME,
                 )
+        elif "://" in value and not is_cluster_internal(value):
+            _emit_external(graph, node_id, env, key, value, source_file, Signal.ENV_LITERAL)
 
-        # 4. volume-mounted config (per deployment, not per container)
-        ns = graph.nodes[node_id].namespace or "default"
-        for cm_name in dep.configmap_volumes:
-            targets = index.discovery_configmaps.get(cm_name)
-            if targets:  # a service-discovery configmap mounted as a file
-                catalog = cm_name in index.catalog_configmaps
-                for env_key, target in targets.items():
-                    dst = _ensure_service_target(graph, index, target)
-                    if dst == node_id:
-                        continue
-                    _emit_configmap_call(
-                        graph, node_id, dst, env, cm_name, env_key,
-                        dep.resource.source_file, catalog=catalog,
-                    )
-            else:  # plain config — record the dependency on the configmap
-                _emit_reference(graph, node_id, NodeType.CONFIGMAP, "cm", ns, cm_name, env, dep.resource.source_file)
-        for secret_name in dep.secret_volumes:
-            sv = secret_index.get(secret_name)
-            # Store ONLY the key names and the Secret's own file location — never values.
-            secret_attrs = (
-                {"keys": list(sv.key_names), "source_file": sv.source_file} if sv else None
-            )
+
+def _envfrom_secret_edges(
+    graph: Graph,
+    node_id: str,
+    dep_ns: str,
+    container,
+    env: Environment,
+    secret_index: dict,
+    service_name: str,
+) -> None:
+    """Secrets consumed via envFrom: key-name heuristics (datastores/queues) plus
+    a REFERENCES edge recording ALL key names + file location (never values), so
+    keys without a datastore match aren't lost."""
+    for secret_name in container.env_from_secrets:
+        secret = secret_index.get(secret_name)
+        if secret is None:
+            continue
+        for key in secret.key_names:
+            _emit_heuristic(graph, node_id, service_name, env, key, secret.source_file)
+        _emit_reference(
+            graph, node_id, NodeType.SECRET, "secret",
+            dep_ns, secret_name, env,
+            secret.source_file,
+            node_attrs={"keys": list(secret.key_names), "source_file": secret.source_file},
+            signal=Signal.ENV_FROM,
+        )
+
+
+def _volume_config_edges(
+    graph: Graph,
+    index: _ServiceIndex,
+    dep: DeploymentView,
+    node_id: str,
+    env: Environment,
+    secret_index: dict,
+) -> None:
+    """Volume-mounted config (per deployment, not per container): a mounted
+    discovery configmap still yields call edges; plain config/secrets become
+    REFERENCES edges with their mount paths."""
+    ns = graph.nodes[node_id].namespace or "default"
+    for cm_name in dep.configmap_volumes:
+        targets = index.discovery_configmaps.get(cm_name)
+        if targets:  # a service-discovery configmap mounted as a file
+            catalog = cm_name in index.catalog_configmaps
+            for env_key, target in targets.items():
+                dst = _ensure_service_target(graph, index, target)
+                if dst == node_id:
+                    continue
+                _emit_configmap_call(
+                    graph, node_id, dst, env, cm_name, env_key,
+                    dep.resource.source_file, catalog=catalog,
+                )
+        else:  # plain config — record the dependency on the configmap
             _emit_reference(
-                graph, node_id, NodeType.SECRET, "secret", ns, secret_name, env,
-                dep.resource.source_file, node_attrs=secret_attrs,
+                graph, node_id, NodeType.CONFIGMAP, "cm", ns, cm_name, env,
+                dep.resource.source_file,
+                mount_paths=dep.configmap_mount_paths.get(cm_name),
             )
+    for secret_name in dep.secret_volumes:
+        sv = secret_index.get(secret_name)
+        # Store ONLY the key names and the Secret's own file location — never values.
+        secret_attrs = (
+            {"keys": list(sv.key_names), "source_file": sv.source_file} if sv else None
+        )
+        _emit_reference(
+            graph, node_id, NodeType.SECRET, "secret", ns, secret_name, env,
+            dep.resource.source_file, node_attrs=secret_attrs,
+            mount_paths=dep.secret_mount_paths.get(secret_name),
+        )
 
-    # 5. helmCharts -> explicit depends_on_chart (overlay-level -> primary node)
+
+def _helmchart_edges(graph: Graph, result: ExtractResult, primary: str, env: Environment) -> None:
+    """helmCharts -> explicit depends_on_chart (overlay-level -> primary node)."""
     for chart in result.helm_charts:
         chart_id = f"chart:{(chart.repo or '')}/{chart.name}@{chart.version or 'latest'}"
         graph.add_node(
@@ -448,15 +700,19 @@ def _virtualservice_routes(
             if not isinstance(rule, dict):
                 continue
             for route in rule.get("route") or []:
-                host = ((route or {}).get("destination") or {}).get("host")
+                destination = (route or {}).get("destination") or {}
+                host = destination.get("host")
                 dst = _resolve_route_host(graph, index, host, default_ns)
                 if dst is None:
                     continue
+                port = (destination.get("port") or {}).get("number")
+                route_attrs = {"port": port} if isinstance(port, int) else {}
                 if dst != node_id:
                     graph.add_edge(Edge(
                         src_id=node_id, dst_id=dst, type=EdgeType.ROUTES_TO, environment=env,
                         provenance=Provenance.EXPLICIT, signal=Signal.ISTIO_VS,
                         source_file=res.source_file, source_locator=str(host),
+                        attrs=dict(route_attrs),
                     ))
                 for gw_id in gw_ids:
                     if gw_id == dst:
@@ -465,6 +721,7 @@ def _virtualservice_routes(
                         src_id=gw_id, dst_id=dst, type=EdgeType.ROUTES_TO, environment=env,
                         provenance=Provenance.EXPLICIT, signal=Signal.GATEWAY_BINDING,
                         source_file=res.source_file, source_locator=str(host),
+                        attrs=dict(route_attrs),
                     ))
 
 
@@ -488,14 +745,28 @@ def _ingress_routes(
         graph.add_node(Node(id=host_id, type=NodeType.INGRESS_HOST, name=str(host)))
         for path in ((rule.get("http") or {}).get("paths") or []):
             backend = (path or {}).get("backend") or {}
-            name = ((backend.get("service") or {}).get("name")) or backend.get("serviceName")
+            svc_backend = backend.get("service") or {}
+            name = svc_backend.get("name") or backend.get("serviceName")
             if not name:
                 continue
+            # networking.k8s.io/v1 uses service.port.{number,name}; the legacy
+            # extensions/v1beta1 shape is a bare servicePort (int or name).
+            port = (svc_backend.get("port") or {}) if isinstance(svc_backend.get("port"), dict) else {}
+            route_attrs: dict = {}
+            if isinstance(port.get("number"), int):
+                route_attrs["port"] = port["number"]
+            elif port.get("name"):
+                route_attrs["port_name"] = str(port["name"])
+            elif isinstance(backend.get("servicePort"), int):
+                route_attrs["port"] = backend["servicePort"]
+            elif backend.get("servicePort"):
+                route_attrs["port_name"] = str(backend["servicePort"])
             dst = _ensure_service_target(graph, index, ClusterTarget(service=str(name), namespace=ns))
             graph.add_edge(Edge(
                 src_id=host_id, dst_id=dst, type=EdgeType.ROUTES_TO, environment=env,
                 provenance=Provenance.EXPLICIT, signal=Signal.INGRESS_BACKEND,
                 source_file=res.source_file, source_locator=str(name),
+                attrs=route_attrs,
             ))
 
 
@@ -619,10 +890,12 @@ def _resolve_storage_edges(
     for dep, node_id in pairs:
         for claim in list(dep.pvc_volumes) + list(dep.volume_claim_templates):
             pvc_id = _ensure_storage_node(graph, ns, claim, None)
+            paths = dep.pvc_mount_paths.get(claim)
             graph.add_edge(Edge(
                 src_id=node_id, dst_id=pvc_id, type=EdgeType.MOUNTS, environment=env,
                 provenance=Provenance.EXPLICIT, signal=Signal.VOLUME_CLAIM,
                 source_file=dep.resource.source_file, source_locator=claim,
+                attrs={"mount_paths": list(paths)} if paths else {},
             ))
 
 
@@ -640,10 +913,12 @@ def _ensure_storage_node(graph: Graph, ns: str, name: str, raw: dict | None) -> 
 def _resolve_autoscaler_edges(
     graph: Graph, index: _ServiceIndex, result: ExtractResult, node_id: str, env: Environment
 ) -> None:
-    """HorizontalPodAutoscaler becomes a node that SCALES its scaleTargetRef."""
+    """HorizontalPodAutoscaler and Keda ScaledObject become autoscaler nodes that
+    SCALE their scaleTargetRef. Keda trigger *types* are kept; trigger metadata is
+    dropped on purpose — it can carry hostnames/connection strings."""
     ns = graph.nodes[node_id].namespace or "default"
     for res in result.resources:
-        if res.kind != "HorizontalPodAutoscaler":
+        if res.kind not in ("HorizontalPodAutoscaler", "ScaledObject"):
             continue
         spec = res.raw.get("spec") or {}
         ref = spec.get("scaleTargetRef") or {}
@@ -652,18 +927,34 @@ def _resolve_autoscaler_edges(
             continue
         rns = res.namespace or ns
         hpa_id = f"hpa:{rns}/{res.name}"
-        graph.add_node(Node(
-            id=hpa_id, type=NodeType.AUTOSCALER, name=res.name, namespace=rns,
-            attrs={
+        if res.kind == "ScaledObject":
+            triggers = sorted({
+                str(t["type"])
+                for t in spec.get("triggers") or []
+                if isinstance(t, dict) and t.get("type")
+            })
+            attrs = {
+                "kind": "ScaledObject",
+                "min_replicas": spec.get("minReplicaCount"),
+                "max_replicas": spec.get("maxReplicaCount"),
+                "target_kind": ref.get("kind") or "Deployment",
+                "triggers": triggers,
+            }
+            signal = Signal.KEDA_SCALER
+        else:
+            attrs = {
                 "min_replicas": spec.get("minReplicas"),
                 "max_replicas": spec.get("maxReplicas"),
                 "target_kind": ref.get("kind"),
-            },
+            }
+            signal = Signal.HPA_TARGET
+        graph.add_node(Node(
+            id=hpa_id, type=NodeType.AUTOSCALER, name=res.name, namespace=rns, attrs=attrs,
         ))
         dst = _ensure_service_target(graph, index, ClusterTarget(service=str(target), namespace=rns))
         graph.add_edge(Edge(
             src_id=hpa_id, dst_id=dst, type=EdgeType.SCALES, environment=env,
-            provenance=Provenance.EXPLICIT, signal=Signal.HPA_TARGET,
+            provenance=Provenance.EXPLICIT, signal=signal,
             source_file=res.source_file, source_locator=str(target),
         ))
 
@@ -697,6 +988,84 @@ def _ensure_sa_node(graph: Graph, ns: str, name: str) -> str:
     node_id = f"sa:{ns}/{name}"
     graph.add_node(Node(id=node_id, type=NodeType.SERVICE_ACCOUNT, name=name, namespace=ns))
     return node_id
+
+
+def _resolve_rbac_edges(
+    graph: Graph, index: _ServiceIndex, result: ExtractResult, primary: str, env: Environment
+) -> None:
+    """Lightweight RBAC: a (Cluster)RoleBinding GRANTS its roleRef to each
+    ServiceAccount subject. Only names (plus a rules count for standalone roles)
+    are kept — never rule verbs/resources detail."""
+    ns = graph.nodes[primary].namespace or "default"
+    for res in result.resources:
+        if res.kind in ("Role", "ClusterRole") and res.name:
+            _ensure_role_node(
+                graph,
+                None if res.kind == "ClusterRole" else (res.namespace or ns),
+                res.name,
+                kind=res.kind,
+                rules_count=len(res.raw.get("rules") or []),
+            )
+        if res.kind not in ("RoleBinding", "ClusterRoleBinding"):
+            continue
+        ref = res.raw.get("roleRef") or {}
+        if not isinstance(ref, dict) or not ref.get("name"):
+            continue
+        binding_ns = res.namespace or ns
+        ref_kind = str(ref.get("kind") or "Role")
+        role_id = _ensure_role_node(
+            graph,
+            None if ref_kind == "ClusterRole" else binding_ns,
+            str(ref["name"]),
+            kind=ref_kind,
+        )
+        for subject in res.raw.get("subjects") or []:
+            if (
+                not isinstance(subject, dict)
+                or subject.get("kind") != "ServiceAccount"
+                or not subject.get("name")
+            ):
+                continue
+            sa_id = _ensure_sa_node(graph, str(subject.get("namespace") or binding_ns), str(subject["name"]))
+            graph.add_edge(Edge(
+                src_id=sa_id, dst_id=role_id, type=EdgeType.GRANTS, environment=env,
+                provenance=Provenance.EXPLICIT, signal=Signal.ROLE_BINDING,
+                source_file=res.source_file, source_locator=res.name,
+            ))
+
+
+def _ensure_role_node(
+    graph: Graph, ns: str | None, name: str, *, kind: str, rules_count: int | None = None
+) -> str:
+    node_id = f"role:{ns or 'cluster'}/{name}"
+    attrs: dict = {"kind": kind, "cluster_wide": ns is None}
+    if rules_count is not None:
+        attrs["rules_count"] = rules_count
+    graph.add_node(Node(id=node_id, type=NodeType.ROLE, name=name, namespace=ns, attrs=attrs))
+    return node_id
+
+
+def _resolve_pdb_attrs(
+    graph: Graph, index: _ServiceIndex, result: ExtractResult, primary: str
+) -> None:
+    """A PodDisruptionBudget protects the workload its selector matches: recorded
+    as attrs on that node (no edge — it's a property, not a dependency). Ambiguous
+    selectors (a shared bundle label) are skipped rather than guessed."""
+    ns = graph.nodes[primary].namespace or "default"
+    for res in result.resources:
+        if res.kind != "PodDisruptionBudget" or not res.name:
+            continue
+        spec = res.raw.get("spec") or {}
+        sel = (spec.get("selector") or {}).get("matchLabels") or {}
+        target = _match_selector(index, res.namespace or ns, {str(k): str(v) for k, v in sel.items()})
+        if target is None:
+            continue
+        graph.nodes[target].attrs["disruption_budget"] = {
+            "name": res.name,
+            "min_available": spec.get("minAvailable"),
+            "max_unavailable": spec.get("maxUnavailable"),
+            "source_file": res.source_file,
+        }
 
 
 def _resolve_gateway_edges(
@@ -785,7 +1154,7 @@ def _emit_configmap_call(
     else:
         provenance, confidence, attrs = Provenance.EXPLICIT, 1.0, {}
     graph.add_edge(Edge(
-        src_id=src_id, dst_id=dst_id, type=EdgeType.HTTP_CALLS, environment=env,
+        src_id=src_id, dst_id=dst_id, type=_call_edge_type(graph, dst_id), environment=env,
         provenance=provenance, signal=Signal.CONFIGMAP_URL, source_file=source_file,
         source_locator=f"{cm_name}.{env_key}", confidence=confidence, attrs=attrs,
     ))
@@ -840,19 +1209,33 @@ def _emit_reference(
     source_file: str,
     node_attrs: dict | None = None,
     signal: Signal = Signal.VOLUME_MOUNT,
+    keys: list[str] | None = None,
+    env_map: dict[str, str] | None = None,
+    mount_paths: tuple[str, ...] | None = None,
 ) -> None:
     """Record that a service mounts/consumes a ConfigMap/Secret as config (no values read).
 
     ``node_attrs`` may carry the referenced object's own metadata — for a Secret
     the key/env-var *names* and the file it is defined in — never any secret value.
-    ``signal`` distinguishes a volume mount from an ``envFrom`` reference.
+    ``signal`` distinguishes a volume mount from an ``envFrom`` / ``valueFrom``
+    reference; ``keys`` are the key names this workload consumes (defaults to the
+    referenced object's full key set) and ``env_map`` maps env var -> key for
+    single-key ``valueFrom`` wiring. Names only, never values.
     """
     dst_id = f"{prefix}:{ns}/{name}"
     graph.add_node(Node(id=dst_id, type=node_type, name=name, namespace=ns, attrs=node_attrs or {}))
     # The edge already carries the environment and the app (src_id), so putting the
     # key NAMES here pins each variable to its (app, environment) — one edge per
     # (app, secret, env), so it never merges across environments like the node does.
-    edge_attrs = {"keys": list(node_attrs["keys"])} if node_attrs and node_attrs.get("keys") else {}
+    edge_attrs: dict = {"modes": [signal.value]}
+    if keys is None and node_attrs and node_attrs.get("keys"):
+        keys = list(node_attrs["keys"])
+    if keys:
+        edge_attrs["keys"] = list(dict.fromkeys(keys))
+    if env_map:
+        edge_attrs["env_map"] = dict(env_map)
+    if mount_paths:
+        edge_attrs["mount_paths"] = list(mount_paths)
     graph.add_edge(
         Edge(
             src_id=src_id,
@@ -871,6 +1254,21 @@ def _emit_reference(
     )
 
 
+def _ensure_external_node(graph: Graph, host: str) -> str:
+    dst_id = f"ext:{host.replace('.', '-')}"
+    graph.add_node(Node(id=dst_id, type=NodeType.EXTERNAL_API, name=host, attrs={"host": host}))
+    return dst_id
+
+
+def _call_edge_type(graph: Graph, dst_id: str) -> EdgeType:
+    """An alias may resolve to an external node (ExternalName Service): calling
+    through it is calls_external, not an in-cluster http_calls."""
+    node = graph.nodes.get(dst_id)
+    if node is not None and node.type == NodeType.EXTERNAL_API:
+        return EdgeType.CALLS_EXTERNAL
+    return EdgeType.HTTP_CALLS
+
+
 def _emit_external(
     graph: Graph,
     src_id: str,
@@ -880,12 +1278,8 @@ def _emit_external(
     source_file: str,
     signal: Signal,
 ) -> None:
-    from kubedian.application.heuristics.dns import _extract_host
-
-    host = _extract_host(value) or value
-    slug = host.replace(".", "-")
-    dst_id = f"ext:{slug}"
-    graph.add_node(Node(id=dst_id, type=NodeType.EXTERNAL_API, name=host, attrs={"host": host}))
+    host = extract_host(value) or value
+    dst_id = _ensure_external_node(graph, host)
     graph.add_edge(
         Edge(
             src_id=src_id,

@@ -25,6 +25,8 @@ from kubedian.infrastructure.sqlite import graph_store
 ENV_EDGE_SIGNALS: tuple[str, ...] = (
     Signal.SECRET_KEY_NAME.value,
     Signal.VOLUME_MOUNT.value,
+    Signal.ENV_FROM.value,
+    Signal.ENV_KEY_REF.value,
     Signal.ENV_LITERAL.value,
     Signal.CONFIGMAP_URL.value,
 )

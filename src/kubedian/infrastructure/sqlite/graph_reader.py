@@ -31,6 +31,9 @@ class IndexMeta:
     service_count: int
     edge_count: int
     render_failures: int
+    # kind -> count of rendered resources the resolver does not graph.
+    # Only refreshed by a full `index` (sync-envs doesn't own it).
+    ignored_kinds: dict[str, int] | None = None
 
 
 class GraphReader:
@@ -61,12 +64,34 @@ class GraphReader:
     def nodes(self) -> list[Node]:
         return [self._node(r) for r in self._conn.execute("SELECT * FROM nodes")]
 
-    def search(self, query: str, limit: int = 25) -> list[Node]:
+    def search(self, query: str, limit: int = 25, namespace: str | None = None) -> list[Node]:
         like = f"%{query.lower()}%"
+        ns_clause, ns_params = (" AND namespace = ?", [namespace]) if namespace else ("", [])
         rows = self._conn.execute(
-            "SELECT * FROM nodes WHERE lower(name) LIKE ? OR lower(id) LIKE ? "
+            f"SELECT * FROM nodes WHERE (lower(name) LIKE ? OR lower(id) LIKE ?){ns_clause} "
             "ORDER BY (type='service') DESC, name LIMIT ?",
-            (like, like, limit),
+            (like, like, *ns_params, limit),
+        )
+        return [self._node(r) for r in rows]
+
+    def nodes_in_namespace(self, namespace: str) -> list[Node]:
+        rows = self._conn.execute(
+            "SELECT * FROM nodes WHERE namespace = ? ORDER BY type, name", (namespace,)
+        )
+        return [self._node(r) for r in rows]
+
+    def bundle_siblings(self, overlay: str, namespace: str, exclude_id: str) -> list[Node]:
+        """Other workloads rendered from the same overlay directory (an
+        api/worker/beat bundle) — identified by the `overlay` attr stamped on
+        every workload node."""
+        rows = self._conn.execute(
+            """
+            SELECT * FROM nodes
+            WHERE json_extract(attrs, '$.overlay') = ? AND namespace = ?
+              AND id != ? AND type IN ('service', 'job', 'cronjob')
+            ORDER BY name
+            """,
+            (overlay, namespace, exclude_id),
         )
         return [self._node(r) for r in rows]
 
@@ -108,6 +133,70 @@ class GraphReader:
         rows = self._conn.execute(f"SELECT * FROM edges{where}", params)
         return [self._edge(r) for r in rows]
 
+    def references(self, node_id: str, environment: Environment | None = None) -> list[Edge]:
+        """Outgoing REFERENCES edges of a workload (its Secrets/ConfigMaps)."""
+        clause, params = self._env_clause(environment)
+        rows = self._conn.execute(
+            f"SELECT * FROM edges WHERE src_id = ? AND type = ?{clause} ORDER BY dst_id",
+            [node_id, EdgeType.REFERENCES.value, *params],
+        )
+        return [self._edge(r) for r in rows]
+
+    def find_key_refs(
+        self,
+        query: str,
+        environment: Environment | None = None,
+        *,
+        partial: bool = False,
+    ) -> list[Edge]:
+        """Reverse lookup: REFERENCES edges whose consumed key names — or the env
+        var names mapped to them — match ``query``. Matches NAMES only; secret
+        values are never stored, so they can never be searched or returned."""
+        clause, params = self._env_clause(environment)
+        if partial:
+            match, arg = "LIKE ? COLLATE NOCASE", f"%{query}%"
+        else:
+            match, arg = "= ? COLLATE NOCASE", query
+        sql = f"""
+            SELECT DISTINCT e.* FROM edges e
+            WHERE e.type = ?{clause} AND (
+                EXISTS (SELECT 1 FROM json_each(e.attrs, '$.keys') k
+                        WHERE k.value {match})
+                OR EXISTS (SELECT 1 FROM json_each(e.attrs, '$.env_map') m
+                           WHERE m.key {match} OR m.value {match})
+            )
+            ORDER BY e.src_id
+        """
+        rows = self._conn.execute(
+            sql, [EdgeType.REFERENCES.value, *params, arg, arg, arg]
+        )
+        return [self._edge(r) for r in rows]
+
+    def nodes_with_port(self, port: int) -> list[Node]:
+        """Nodes that listen on / expose ``port`` (containerPorts or Service ports)."""
+        sql = """
+            SELECT DISTINCT n.* FROM nodes n
+            WHERE EXISTS (SELECT 1 FROM json_each(n.attrs, '$.ports') p
+                          WHERE p.value = ?)
+               OR EXISTS (SELECT 1 FROM json_each(n.attrs, '$.port_map') pm
+                          WHERE json_extract(pm.value, '$.port') = ?
+                             OR json_extract(pm.value, '$.target_port') = ?)
+            ORDER BY n.name
+        """
+        rows = self._conn.execute(sql, [port, port, port])
+        return [self._node(r) for r in rows]
+
+    def routes_with_port(self, port: int, environment: Environment | None = None) -> list[Edge]:
+        """ROUTES_TO edges (Ingress/VirtualService) that target ``port``."""
+        clause, params = self._env_clause(environment)
+        sql = f"""
+            SELECT * FROM edges
+            WHERE type = ?{clause} AND json_extract(attrs, '$.port') = ?
+            ORDER BY src_id
+        """
+        rows = self._conn.execute(sql, [EdgeType.ROUTES_TO.value, *params, port])
+        return [self._edge(r) for r in rows]
+
     def graph(self, environment: Environment | None = None) -> Graph:
         """Load the full graph, optionally filtered to one environment.
 
@@ -145,6 +234,8 @@ class GraphReader:
         row = self._conn.execute("SELECT * FROM index_meta WHERE id = 1").fetchone()
         if not row:
             return None
+        # Defensive: pre-migration DBs may lack the column.
+        ignored = row["ignored_kinds"] if "ignored_kinds" in row.keys() else None
         return IndexMeta(
             repo_path=row["repo_path"],
             indexed_at=row["indexed_at"],
@@ -152,6 +243,7 @@ class GraphReader:
             service_count=row["service_count"],
             edge_count=row["edge_count"],
             render_failures=row["render_failures"],
+            ignored_kinds=json.loads(ignored) if ignored else None,
         )
 
     def close(self) -> None:

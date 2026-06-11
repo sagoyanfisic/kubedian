@@ -15,6 +15,7 @@ from kubedian.application.pipeline.discover import Overlay
 from kubedian.domain.entities.resource import (
     ContainerView,
     DeploymentView,
+    EnvKeyRef,
     HelmChartRef,
     K8sResource,
     RenderMode,
@@ -32,6 +33,15 @@ _WORKLOAD_KINDS = {"Deployment", "StatefulSet", "DaemonSet", "Job", "CronJob"}
 
 # The node label whose value names the node pool a workload is pinned to.
 _NODEPOOL_LABEL = "purpose"
+
+# Well-known sidecar container names; injected proxies aren't the workload itself.
+_SIDECAR_NAMES = {
+    "istio-proxy",
+    "envoy",
+    "linkerd-proxy",
+    "cloud-sql-proxy",
+    "cloudsql-proxy",
+}
 
 
 @dataclass
@@ -117,49 +127,48 @@ def _build(
 
 def _deployment_view(res: K8sResource) -> DeploymentView:
     spec = res.raw.get("spec") or {}
-    template = spec.get("template") or {}
+    # A CronJob nests its pod template under spec.jobTemplate.spec.template.
+    if res.kind == "CronJob":
+        template_spec = (spec.get("jobTemplate") or {}).get("spec") or {}
+    else:
+        template_spec = spec
+    template = template_spec.get("template") or {}
     pod_spec = template.get("spec") or {}
-    containers_raw = pod_spec.get("containers") or []
     containers: list[ContainerView] = []
     ports: list[int] = []
-    for c in containers_raw:
-        for p in c.get("ports") or []:
-            if isinstance(p, dict) and isinstance(p.get("containerPort"), int):
-                ports.append(p["containerPort"])
-        env_literals: dict[str, str] = {}
-        for e in c.get("env") or []:
-            if isinstance(e, dict) and "value" in e and "name" in e:
-                env_literals[str(e["name"])] = str(e["value"])
-        secret_refs: list[str] = []
-        cm_refs: list[str] = []
-        for ef in c.get("envFrom") or []:
-            if not isinstance(ef, dict):
+    named_ports: dict[str, int] = {}
+    raw_groups = (
+        (pod_spec.get("containers") or [], False),
+        (pod_spec.get("initContainers") or [], True),
+    )
+    for containers_raw, is_init in raw_groups:
+        for c in containers_raw:
+            if not isinstance(c, dict):
                 continue
-            if (sr := ef.get("secretRef")) and sr.get("name"):
-                secret_refs.append(str(sr["name"]))
-            if (cr := ef.get("configMapRef")) and cr.get("name"):
-                cm_refs.append(str(cr["name"]))
-        containers.append(
-            ContainerView(
-                name=str(c.get("name") or ""),
-                image=c.get("image"),
-                env=env_literals,
-                env_from_secrets=secret_refs,
-                env_from_configmaps=cm_refs,
-            )
-        )
+            for p in c.get("ports") or []:
+                if isinstance(p, dict) and isinstance(p.get("containerPort"), int):
+                    ports.append(p["containerPort"])
+                    if p.get("name"):
+                        named_ports[str(p["name"])] = p["containerPort"]
+            containers.append(_container_view(c, role=_container_role(c, is_init=is_init)))
     secret_vols: list[str] = []
     cm_vols: list[str] = []
     pvc_vols: list[str] = []
+    vol_sources: dict[str, tuple[str, str]] = {}  # volume name -> (kind, source name)
     for vol in pod_spec.get("volumes") or []:
         if not isinstance(vol, dict):
             continue
+        vol_name = str(vol.get("name") or "")
         if (s := vol.get("secret")) and s.get("secretName"):
             secret_vols.append(str(s["secretName"]))
+            vol_sources[vol_name] = ("secret", str(s["secretName"]))
         if (cm := vol.get("configMap")) and cm.get("name"):
             cm_vols.append(str(cm["name"]))
+            vol_sources[vol_name] = ("configmap", str(cm["name"]))
         if (pvc := vol.get("persistentVolumeClaim")) and pvc.get("claimName"):
             pvc_vols.append(str(pvc["claimName"]))
+            vol_sources[vol_name] = ("pvc", str(pvc["claimName"]))
+    mount_paths = _mount_paths(containers, vol_sources)
     # StatefulSet declares its PVCs inline via volumeClaimTemplates.
     vct_names = [
         str(t["metadata"]["name"])
@@ -182,11 +191,125 @@ def _deployment_view(res: K8sResource) -> DeploymentView:
         workload_kind=res.kind,
         replicas=replicas if isinstance(replicas, int) else None,
         ports=tuple(dict.fromkeys(ports)),
+        named_ports=named_ports,
         service_account=pod_spec.get("serviceAccountName"),
         nodepool=_nodepool(pod_spec),
         pvc_volumes=tuple(dict.fromkeys(pvc_vols)),
         volume_claim_templates=tuple(dict.fromkeys(vct_names)),
+        secret_mount_paths=mount_paths["secret"],
+        configmap_mount_paths=mount_paths["configmap"],
+        pvc_mount_paths=mount_paths["pvc"],
     )
+
+
+def _container_view(c: dict[str, Any], *, role: str) -> ContainerView:
+    env_literals: dict[str, str] = {}
+    secret_key_refs: list[EnvKeyRef] = []
+    cm_key_refs: list[EnvKeyRef] = []
+    for e in c.get("env") or []:
+        if not isinstance(e, dict) or "name" not in e:
+            continue
+        if "value" in e:
+            env_literals[str(e["name"])] = str(e["value"])
+            continue
+        # valueFrom wiring: record only NAMES (var, ref, key) — never the value.
+        vf = e.get("valueFrom") or {}
+        if (skr := vf.get("secretKeyRef")) and skr.get("name") and skr.get("key"):
+            secret_key_refs.append(
+                EnvKeyRef(var=str(e["name"]), ref=str(skr["name"]), key=str(skr["key"]))
+            )
+        if (ckr := vf.get("configMapKeyRef")) and ckr.get("name") and ckr.get("key"):
+            cm_key_refs.append(
+                EnvKeyRef(var=str(e["name"]), ref=str(ckr["name"]), key=str(ckr["key"]))
+            )
+    secret_refs: list[str] = []
+    cm_refs: list[str] = []
+    for ef in c.get("envFrom") or []:
+        if not isinstance(ef, dict):
+            continue
+        if (sr := ef.get("secretRef")) and sr.get("name"):
+            secret_refs.append(str(sr["name"]))
+        if (cr := ef.get("configMapRef")) and cr.get("name"):
+            cm_refs.append(str(cr["name"]))
+    volume_mounts = tuple(
+        (str(vm["name"]), str(vm["mountPath"]))
+        for vm in c.get("volumeMounts") or []
+        if isinstance(vm, dict) and vm.get("name") and vm.get("mountPath")
+    )
+    resources = c.get("resources")
+    return ContainerView(
+        name=str(c.get("name") or ""),
+        image=c.get("image"),
+        env=env_literals,
+        env_from_secrets=secret_refs,
+        env_from_configmaps=cm_refs,
+        secret_key_refs=tuple(secret_key_refs),
+        configmap_key_refs=tuple(cm_key_refs),
+        role=role,
+        resources=resources if isinstance(resources, dict) and resources else None,
+        probes=_probe_summary(c),
+        volume_mounts=volume_mounts,
+    )
+
+
+def _container_role(c: dict[str, Any], *, is_init: bool) -> str:
+    if is_init:
+        # A native sidecar is declared as an initContainer with restartPolicy: Always.
+        return "sidecar" if c.get("restartPolicy") == "Always" else "init"
+    return "sidecar" if str(c.get("name") or "") in _SIDECAR_NAMES else "main"
+
+
+def _probe_summary(c: dict[str, Any]) -> dict[str, dict[str, Any]] | None:
+    """Compact probe facts: kind of check plus port/path — never command contents."""
+    probes: dict[str, dict[str, Any]] = {}
+    for label, field_name in (
+        ("liveness", "livenessProbe"),
+        ("readiness", "readinessProbe"),
+        ("startup", "startupProbe"),
+    ):
+        probe = c.get(field_name)
+        if not isinstance(probe, dict):
+            continue
+        if isinstance(http := probe.get("httpGet"), dict):
+            summary: dict[str, Any] = {"type": "http"}
+            if http.get("port") is not None:
+                summary["port"] = http["port"]
+            if http.get("path"):
+                summary["path"] = str(http["path"])
+        elif isinstance(tcp := probe.get("tcpSocket"), dict):
+            summary = {"type": "tcp"}
+            if tcp.get("port") is not None:
+                summary["port"] = tcp["port"]
+        elif isinstance(grpc := probe.get("grpc"), dict):
+            summary = {"type": "grpc"}
+            if grpc.get("port") is not None:
+                summary["port"] = grpc["port"]
+        elif probe.get("exec"):
+            summary = {"type": "exec"}
+        else:
+            continue
+        probes[label] = summary
+    return probes or None
+
+
+def _mount_paths(
+    containers: list[ContainerView], vol_sources: dict[str, tuple[str, str]]
+) -> dict[str, dict[str, tuple[str, ...]]]:
+    """Join volumes × volumeMounts into source-object name -> mountPaths maps."""
+    out: dict[str, dict[str, list[str]]] = {"secret": {}, "configmap": {}, "pvc": {}}
+    for container in containers:
+        for vol_name, path in container.volume_mounts:
+            source = vol_sources.get(vol_name)
+            if source is None:
+                continue
+            kind, source_name = source
+            paths = out[kind].setdefault(source_name, [])
+            if path not in paths:
+                paths.append(path)
+    return {
+        kind: {name: tuple(paths) for name, paths in by_name.items()}
+        for kind, by_name in out.items()
+    }
 
 
 def _nodepool(pod_spec: dict[str, Any]) -> str | None:

@@ -6,12 +6,20 @@ GraphReader and returns plain dicts (already serialised, provenance included).
 
 from __future__ import annotations
 
-from collections import deque
+from collections import defaultdict, deque
 
 from kubedian.domain.entities.graph import EdgeType, Environment, NodeType
 from kubedian.infrastructure.sqlite.graph_reader import GraphReader
 
 _DATASTORE_TYPES = {NodeType.DATABASE, NodeType.CACHE, NodeType.QUEUE}
+
+
+def _edges_by_type(edges) -> dict[EdgeType, list]:
+    """Bucket a callers/callees edge list by EdgeType (shared traversal helper)."""
+    out: dict[EdgeType, list] = defaultdict(list)
+    for e in edges:
+        out[e.type].append(e)
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -48,6 +56,19 @@ def edge_dict(edge, reader: GraphReader, *, other: str) -> dict:
     }
 
 
+def composition_node_dict(node) -> dict:
+    """Full workload detail — only the composition query serialises this much
+    (node_dict stays lean on purpose). Names only, never values."""
+    d = node_dict(node)
+    for key in (
+        "named_ports", "port_map", "env_vars", "containers",
+        "disruption_budget", "overlay", "app_label", "render_mode",
+    ):
+        if node.attrs.get(key) is not None:
+            d[key] = node.attrs[key]
+    return d
+
+
 def _scaler_dict(edge, reader: GraphReader) -> dict:
     """An incoming SCALES edge: relabel the source (the HPA) as `autoscaler`."""
     d = edge_dict(edge, reader, other="src_id")
@@ -55,10 +76,11 @@ def _scaler_dict(edge, reader: GraphReader) -> dict:
     return d
 
 
-def find_service_id(reader: GraphReader, ref: str) -> str | None:
-    if reader.node(ref):
+def find_service_id(reader: GraphReader, ref: str, namespace: str | None = None) -> str | None:
+    node = reader.node(ref)
+    if node and (namespace is None or node.namespace == namespace):
         return ref
-    matches = reader.search(ref, limit=50)
+    matches = reader.search(ref, limit=50, namespace=namespace)
     services = [n for n in matches if n.type == NodeType.SERVICE]
     pool = services or matches
     return pool[0].id if pool else None
@@ -67,8 +89,8 @@ def find_service_id(reader: GraphReader, ref: str) -> str | None:
 # --------------------------------------------------------------------------- #
 # queries
 # --------------------------------------------------------------------------- #
-def search(reader: GraphReader, query: str, limit: int = 25) -> dict:
-    return {"results": [node_dict(n) for n in reader.search(query, limit)]}
+def search(reader: GraphReader, query: str, limit: int = 25, namespace: str | None = None) -> dict:
+    return {"results": [node_dict(n) for n in reader.search(query, limit, namespace=namespace)]}
 
 
 def context(reader: GraphReader, service: str, env: Environment | None) -> dict:
@@ -93,13 +115,12 @@ def context(reader: GraphReader, service: str, env: Environment | None) -> dict:
             identity.append(edge_dict(e, reader, other="dst_id"))
         elif e.type == EdgeType.ROUTES_TO:
             routing.append(edge_dict(e, reader, other="dst_id"))
+    by_type = _edges_by_type(callers)
     return {
         "service": node_dict(node),
         "calls": calls,
         "called_by": [
-            edge_dict(e, reader, other="src_id")
-            for e in callers
-            if e.type == EdgeType.HTTP_CALLS
+            edge_dict(e, reader, other="src_id") for e in by_type[EdgeType.HTTP_CALLS]
         ],
         "datastores": datastores,
         "external_dependencies": external,
@@ -108,7 +129,7 @@ def context(reader: GraphReader, service: str, env: Environment | None) -> dict:
         "identity": identity,
         # HPA -> service is an incoming SCALES edge; surface the HPA as `autoscaler`
         # rather than the generic `service` key edge_dict uses for src direction.
-        "autoscaling": [_scaler_dict(e, reader) for e in callers if e.type == EdgeType.SCALES],
+        "autoscaling": [_scaler_dict(e, reader) for e in by_type[EdgeType.SCALES]],
     }
 
 
@@ -160,6 +181,309 @@ def datastore_clients(reader: GraphReader, datastore: str, env: Environment | No
     return {"datastore": node_id, "clients": [edge_dict(e, reader, other="src_id") for e in edges]}
 
 
+def _config_entries(reader: GraphReader, node_id: str, env: Environment | None) -> tuple[list, list]:
+    """The Secrets/ConfigMaps a workload references — KEY NAMES ONLY, never values."""
+    secrets, configmaps = [], []
+    for e in reader.references(node_id, env):
+        dst = reader.node(e.dst_id)
+        if dst is None or dst.type not in (NodeType.SECRET, NodeType.CONFIGMAP):
+            continue
+        entry = {
+            "name": dst.name,
+            "node_id": dst.id,
+            "namespace": dst.namespace,
+            "modes": e.attrs.get("modes") or [e.signal.value],
+            "keys": e.attrs.get("keys"),
+            "env_map": e.attrs.get("env_map"),
+            "mount_paths": e.attrs.get("mount_paths"),
+            "provenance": e.provenance.value,
+            "environment": e.environment.value,
+            "source_file": e.source_file,
+        }
+        (secrets if dst.type == NodeType.SECRET else configmaps).append(entry)
+    return secrets, configmaps
+
+
+def service_secrets(reader: GraphReader, service: str, env: Environment | None) -> dict:
+    """Secrets and ConfigMaps a service consumes — KEY NAMES ONLY, never values."""
+    node_id = find_service_id(reader, service)
+    if node_id is None:
+        return {"error": f"no service matching {service!r}"}
+    secrets, configmaps = _config_entries(reader, node_id, env)
+    return {
+        "service": node_dict(reader.node(node_id)),
+        "secrets": secrets,
+        "configmaps": configmaps,
+    }
+
+
+def service_composition(reader: GraphReader, service: str, env: Environment | None) -> dict:
+    """The complete technical composition of one service in a single call:
+    full identity (containers, ports, env var names), bundle siblings, config
+    consumed (key NAMES only — never values), storage, autoscaling, identity +
+    RBAC, NetworkPolicy connectivity (both directions), and routing exposure.
+
+    Unlike context(), this includes allows_to edges — they describe the service's
+    structure (what it is permitted to reach), still never presented as calls."""
+    node_id = find_service_id(reader, service)
+    if node_id is None:
+        return {"error": f"no service matching {service!r}"}
+    node = reader.node(node_id)
+    out_edges = _edges_by_type(reader.callees(node_id, env))
+    in_edges = _edges_by_type(reader.callers(node_id, env))
+
+    storage = []
+    for e in out_edges[EdgeType.MOUNTS]:
+        d = edge_dict(e, reader, other="dst_id")
+        d["mount_paths"] = e.attrs.get("mount_paths")
+        storage.append(d)
+    identity = [edge_dict(e, reader, other="dst_id") for e in out_edges[EdgeType.RUNS_AS]]
+    egress_allowed = [edge_dict(e, reader, other="dst_id") for e in out_edges[EdgeType.ALLOWS_TO]]
+    ingress_allowed = [edge_dict(e, reader, other="src_id") for e in in_edges[EdgeType.ALLOWS_TO]]
+    exposure = []
+    for e in in_edges[EdgeType.ROUTES_TO]:
+        d = edge_dict(e, reader, other="src_id")
+        d["port"] = e.attrs.get("port")
+        d["port_name"] = e.attrs.get("port_name")
+        exposure.append(d)
+
+    # Roles granted to the service's ServiceAccount(s) — one extra hop.
+    rbac = []
+    for e in out_edges[EdgeType.RUNS_AS]:
+        sa = reader.node(e.dst_id)
+        for g in reader.callees(e.dst_id, env):
+            if g.type != EdgeType.GRANTS:
+                continue
+            role = reader.node(g.dst_id)
+            rbac.append({
+                "service_account": sa.name if sa else e.dst_id,
+                "role": role.name if role else g.dst_id,
+                "role_node_id": g.dst_id,
+                "role_kind": role.attrs.get("kind") if role else None,
+                "cluster_wide": role.attrs.get("cluster_wide") if role else None,
+                "source_file": g.source_file,
+            })
+
+    bundle = []
+    overlay = node.attrs.get("overlay")
+    if overlay and node.namespace:
+        bundle = [node_dict(n) for n in reader.bundle_siblings(overlay, node.namespace, node_id)]
+
+    secrets, configmaps = _config_entries(reader, node_id, env)
+    return {
+        "service": composition_node_dict(node),
+        "namespace": node.namespace,
+        "bundle": bundle,
+        "config": {"secrets": secrets, "configmaps": configmaps},
+        "storage": storage,
+        "autoscaling": [_scaler_dict(e, reader) for e in in_edges[EdgeType.SCALES]],
+        "service_account": identity,
+        "rbac": rbac,
+        "network_policies": {
+            "egress_allowed_to": egress_allowed,
+            "ingress_allowed_from": ingress_allowed,
+        },
+        "exposure": exposure,
+    }
+
+
+def list_namespaces(reader: GraphReader, env: Environment | None) -> dict:
+    """Namespaces with their services, job/cronjob counts, and cross-namespace call counts."""
+    by_ns: dict[str, list[dict]] = defaultdict(list)
+    jobs_by_ns: dict[str, int] = defaultdict(int)
+    cronjobs_by_ns: dict[str, int] = defaultdict(int)
+    ns_of: dict[str, str] = {}
+    for n in reader.nodes():
+        if not n.namespace:
+            continue
+        if n.type == NodeType.SERVICE:
+            by_ns[n.namespace].append(node_dict(n))
+            ns_of[n.id] = n.namespace
+        elif n.type == NodeType.JOB:
+            jobs_by_ns[n.namespace] += 1
+        elif n.type == NodeType.CRONJOB:
+            cronjobs_by_ns[n.namespace] += 1
+    cross: dict[str, int] = defaultdict(int)
+    for e in reader.edges(env):
+        if e.type == EdgeType.HTTP_CALLS:
+            s, d = ns_of.get(e.src_id), ns_of.get(e.dst_id)
+            if s and d and s != d:
+                cross[f"{s} → {d}"] += 1
+    all_ns = sorted(set(by_ns) | set(jobs_by_ns) | set(cronjobs_by_ns))
+    return {
+        "namespaces": [
+            {
+                "namespace": ns,
+                "service_count": len(by_ns.get(ns, [])),
+                "services": by_ns.get(ns, []),
+                "job_count": jobs_by_ns.get(ns, 0),
+                "cronjob_count": cronjobs_by_ns.get(ns, 0),
+            }
+            for ns in all_ns
+        ],
+        "cross_namespace_calls": dict(cross),
+    }
+
+
+def namespace_context(reader: GraphReader, namespace: str) -> dict:
+    """All workloads in a namespace: services (long-running), Jobs and CronJobs."""
+    buckets: dict[NodeType, list[dict]] = {NodeType.SERVICE: [], NodeType.JOB: [], NodeType.CRONJOB: []}
+    for n in reader.nodes_in_namespace(namespace):
+        if n.type in buckets:
+            buckets[n.type].append(node_dict(n))
+    return {
+        "namespace": namespace,
+        "service_count": len(buckets[NodeType.SERVICE]),
+        "services": buckets[NodeType.SERVICE],
+        "job_count": len(buckets[NodeType.JOB]),
+        "jobs": buckets[NodeType.JOB],
+        "cronjob_count": len(buckets[NodeType.CRONJOB]),
+        "cronjobs": buckets[NodeType.CRONJOB],
+    }
+
+
+def namespace_contents(reader: GraphReader, namespace: str, env: Environment | None) -> dict:
+    """Everything that lives in a namespace, grouped by node type, plus an
+    aggregate of its cross-namespace relations (edges in/out of the namespace)."""
+    nodes = reader.nodes_in_namespace(namespace)
+    if not nodes:
+        return {"error": f"no nodes in namespace {namespace!r}"}
+    contents: dict[str, list] = {}
+    for n in nodes:
+        contents.setdefault(n.type.value, []).append(node_dict(n))
+    in_ns = {n.id for n in nodes}
+    ns_of = {n.id: n.namespace for n in reader.nodes()}
+    outgoing: dict[tuple, dict] = {}
+    incoming: dict[tuple, dict] = {}
+    for e in reader.edges(env):
+        if e.type == EdgeType.IN_NAMESPACE:
+            continue
+        src_in, dst_in = e.src_id in in_ns, e.dst_id in in_ns
+        if src_in == dst_in:  # internal to the namespace, or unrelated
+            continue
+        peer = ns_of.get(e.dst_id if src_in else e.src_id)
+        if not peer:  # peer without a namespace (external API, ingress host…)
+            continue
+        bucket = outgoing if src_in else incoming
+        entry = bucket.setdefault((peer, e.type.value), {
+            "peer_namespace": peer,
+            "edge_type": e.type.value,
+            "count": 0,
+            "examples": [],
+        })
+        entry["count"] += 1
+        if len(entry["examples"]) < 3:
+            entry["examples"].append(f"{e.src_id} -> {e.dst_id}")
+    return {
+        "namespace": namespace,
+        "counts": {t: len(v) for t, v in contents.items()},
+        "contents": contents,
+        "cross_namespace": {
+            "outgoing": list(outgoing.values()),
+            "incoming": list(incoming.values()),
+        },
+    }
+
+
+def service_ports(reader: GraphReader, service: str, env: Environment | None) -> dict:
+    """Every port fact known for a service: containerPorts, the Service's
+    port->targetPort wiring, and how it is exposed via Ingress/VirtualService."""
+    node_id = find_service_id(reader, service)
+    if node_id is None:
+        return {"error": f"no service matching {service!r}"}
+    node = reader.node(node_id)
+    exposed = []
+    for e in reader.callers(node_id, env):
+        if e.type != EdgeType.ROUTES_TO:
+            continue
+        d = edge_dict(e, reader, other="src_id")
+        d["port"] = e.attrs.get("port")
+        d["port_name"] = e.attrs.get("port_name")
+        exposed.append(d)
+    return {
+        "service": node_dict(node),
+        "container_ports": node.attrs.get("ports") or [],
+        "named_ports": node.attrs.get("named_ports"),
+        "service_ports": node.attrs.get("port_map") or [],
+        "exposed_via": exposed,
+    }
+
+
+def find_key_usage(
+    reader: GraphReader,
+    query: str,
+    env: Environment | None,
+    partial: bool = False,
+    limit: int = 100,
+    namespace: str | None = None,
+) -> dict:
+    """Reverse lookup by env var / secret key NAME. Returns who consumes it, from
+    which Secret/ConfigMap, and through which env var — names only, never values."""
+    q = query.lower()
+
+    def _matches(name: str) -> bool:
+        return q in name.lower() if partial else q == name.lower()
+
+    matches = []
+    for e in reader.find_key_refs(query, env, partial=partial):
+        src = reader.node(e.src_id)
+        dst = reader.node(e.dst_id)
+        if namespace is not None and (src is None or src.namespace != namespace):
+            continue
+        env_map: dict = e.attrs.get("env_map") or {}
+        modes = e.attrs.get("modes") or [e.signal.value]
+        base = {
+            "workload": src.name if src else e.src_id,
+            "workload_id": e.src_id,
+            "ref": dst.name if dst else e.dst_id,
+            "ref_node_id": e.dst_id,
+            "ref_type": dst.type.value if dst else None,
+            "environment": e.environment.value,
+            "provenance": e.provenance.value,
+            "source_file": e.source_file,
+        }
+        # Expand the edge into per-key matches: valueFrom keys carry their env var
+        # name; envFrom keys ARE the var name; volume-mounted keys have no var.
+        # A key consumed through several modes yields one match per mode.
+        for var, key in env_map.items():
+            if _matches(var) or _matches(key):
+                matches.append({**base, "var": var, "key": key, "mode": "env_key_ref"})
+        other_mode = next((m for m in modes if m != "env_key_ref"), None)
+        if other_mode:
+            for key in e.attrs.get("keys") or []:
+                if not _matches(key):
+                    continue
+                matches.append({
+                    **base,
+                    "var": key if other_mode == "env_from" else None,
+                    "key": key,
+                    "mode": other_mode,
+                })
+    return {"query": query, "match_count": len(matches), "matches": matches[:limit]}
+
+
+def find_port(
+    reader: GraphReader, port: int, env: Environment | None, namespace: str | None = None
+) -> dict:
+    """Who listens on / routes to a given port number."""
+    listeners = [
+        node_dict(n)
+        for n in reader.nodes_with_port(port)
+        if namespace is None or n.namespace == namespace
+    ]
+    routes = []
+    for e in reader.routes_with_port(port, env):
+        dst = reader.node(e.dst_id)
+        if namespace is not None and (dst is None or dst.namespace != namespace):
+            continue
+        d = edge_dict(e, reader, other="dst_id")
+        src = reader.node(e.src_id)
+        d["via"] = src.name if src else e.src_id
+        d["port"] = e.attrs.get("port")
+        routes.append(d)
+    return {"port": port, "listeners": listeners, "routed_by": routes}
+
+
 def status(reader: GraphReader) -> dict:
     from collections import Counter
 
@@ -174,6 +498,9 @@ def status(reader: GraphReader) -> dict:
         "service_count": meta.service_count if meta else node_types.get("service", 0),
         "edge_count": meta.edge_count if meta else len(reader.edges()),
         "render_failures": meta.render_failures if meta else None,
+        # Kinds seen in manifests but not graphed — refreshed by full `index` only.
+        "ignored_kinds": (meta.ignored_kinds or {}) if meta else {},
+        "ignored_kind_count": sum((meta.ignored_kinds or {}).values()) if meta else 0,
         "node_types": dict(node_types),
         "edge_types": dict(edge_types),
     }

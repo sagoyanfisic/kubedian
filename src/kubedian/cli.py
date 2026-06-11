@@ -2,19 +2,18 @@
 
 from __future__ import annotations
 
+import json as _json
 from collections import Counter
 from pathlib import Path
 from typing import Optional
 
 import typer
 
-import json as _json
-
 from kubedian import __version__
 from kubedian.application.pipeline.index import index_repo
 from kubedian.application.pipeline.sync import sync_envs
 from kubedian.application.use_cases import queries
-from kubedian.config import DEFAULT_LANG, SUPPORTED_LANGS, default_db_path
+from kubedian.config import DEFAULT_LANG, SUPPORTED_LANGS, default_db_path, parse_env
 from kubedian.domain.entities.graph import Environment
 from kubedian.infrastructure.kustomize.runner import kustomize_available
 from kubedian.infrastructure.sqlite.graph_reader import GraphReader
@@ -112,7 +111,12 @@ def sync_envs_cmd(
 def _sync_with_progress(target: Path, db_path: Path, environment) -> dict:
     try:
         from rich.progress import (
-            BarColumn, MofNCompleteColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn,
+            BarColumn,
+            MofNCompleteColumn,
+            Progress,
+            SpinnerColumn,
+            TextColumn,
+            TimeElapsedColumn,
         )
     except ImportError:  # pragma: no cover - rich ships with typer
         return sync_envs(target, db_path, environment)
@@ -297,13 +301,14 @@ def status(
 def search(
     query: str = typer.Argument(..., help="Substring of a service / datastore / external name."),
     limit: int = typer.Option(25, "--limit", "-n"),
+    namespace: Optional[str] = typer.Option(None, "--namespace", help="Restrict to one namespace."),
     db: Optional[Path] = typer.Option(None, "--db"),
     repo: Optional[Path] = typer.Option(None, "--repo", "-r"),
     json: bool = typer.Option(False, "--json"),
 ) -> None:
     """Search for services / datastores / external APIs by name."""
     reader = _open_reader(db, repo)
-    _emit(queries.search(reader, query, limit), json)
+    _emit(queries.search(reader, query, limit, namespace=namespace), json)
     reader.close()
 
 
@@ -377,6 +382,93 @@ def impact(
     """Analyze the blast radius: services transitively affected if this one fails."""
     reader = _open_reader(db, repo)
     _emit(queries.impact(reader, service, _parse_env(env), max_depth), json)
+    reader.close()
+
+
+@app.command()
+def composition(
+    service: str = typer.Argument(..., help="Service name or node id."),
+    env: Optional[str] = typer.Option(None, "--env", "-e"),
+    db: Optional[Path] = typer.Option(None, "--db"),
+    repo: Optional[Path] = typer.Option(None, "--repo", "-r"),
+    json: bool = typer.Option(False, "--json"),
+) -> None:
+    """Full technical composition of a service in one call: identity (containers with roles/resources/probes, ports, env var names), bundle siblings, config (key NAMES only — never values), storage, autoscaling, ServiceAccount + RBAC roles, NetworkPolicy connectivity (both directions) and routing exposure."""
+    reader = _open_reader(db, repo)
+    _emit(queries.service_composition(reader, service, _parse_env(env)), json)
+    reader.close()
+
+
+@app.command()
+def namespace(
+    namespace: str = typer.Argument(..., help="Namespace name."),
+    env: Optional[str] = typer.Option(None, "--env", "-e"),
+    db: Optional[Path] = typer.Option(None, "--db"),
+    repo: Optional[Path] = typer.Option(None, "--repo", "-r"),
+    json: bool = typer.Option(False, "--json"),
+) -> None:
+    """Everything living in a namespace grouped by type, plus its cross-namespace relations (edges in/out aggregated by peer namespace and edge type)."""
+    reader = _open_reader(db, repo)
+    _emit(queries.namespace_contents(reader, namespace, _parse_env(env)), json)
+    reader.close()
+
+
+@app.command()
+def secrets(
+    service: str = typer.Argument(..., help="Service name or node id."),
+    env: Optional[str] = typer.Option(None, "--env", "-e"),
+    db: Optional[Path] = typer.Option(None, "--db"),
+    repo: Optional[Path] = typer.Option(None, "--repo", "-r"),
+    json: bool = typer.Option(False, "--json"),
+) -> None:
+    """Secrets and ConfigMaps a service consumes — key NAMES only (never values), with consumption mode and var→key mapping."""
+    reader = _open_reader(db, repo)
+    _emit(queries.service_secrets(reader, service, _parse_env(env)), json)
+    reader.close()
+
+
+@app.command()
+def ports(
+    service: str = typer.Argument(..., help="Service name or node id."),
+    env: Optional[str] = typer.Option(None, "--env", "-e"),
+    db: Optional[Path] = typer.Option(None, "--db"),
+    repo: Optional[Path] = typer.Option(None, "--repo", "-r"),
+    json: bool = typer.Option(False, "--json"),
+) -> None:
+    """Every port fact for a service: containerPorts, the Service's port→targetPort wiring, and Ingress/VirtualService exposure."""
+    reader = _open_reader(db, repo)
+    _emit(queries.service_ports(reader, service, _parse_env(env)), json)
+    reader.close()
+
+
+@app.command(name="find-key")
+def find_key_cmd(
+    query: str = typer.Argument(..., help="Env var or secret/configmap key name (e.g. POSTGRES_HOST)."),
+    partial: bool = typer.Option(False, "--partial", help="Substring match instead of exact (case-insensitive either way)."),
+    namespace: Optional[str] = typer.Option(None, "--namespace", help="Restrict to workloads in one namespace."),
+    env: Optional[str] = typer.Option(None, "--env", "-e"),
+    db: Optional[Path] = typer.Option(None, "--db"),
+    repo: Optional[Path] = typer.Option(None, "--repo", "-r"),
+    json: bool = typer.Option(False, "--json"),
+) -> None:
+    """Reverse lookup: which workloads use an env var / secret key NAME, from which Secret/ConfigMap (names only, never values)."""
+    reader = _open_reader(db, repo)
+    _emit(queries.find_key_usage(reader, query, _parse_env(env), partial=partial, namespace=namespace), json)
+    reader.close()
+
+
+@app.command(name="find-port")
+def find_port_cmd(
+    port: int = typer.Argument(..., help="Port number (e.g. 8000)."),
+    namespace: Optional[str] = typer.Option(None, "--namespace", help="Restrict to one namespace."),
+    env: Optional[str] = typer.Option(None, "--env", "-e"),
+    db: Optional[Path] = typer.Option(None, "--db"),
+    repo: Optional[Path] = typer.Option(None, "--repo", "-r"),
+    json: bool = typer.Option(False, "--json"),
+) -> None:
+    """Reverse lookup: which services listen on a port and which Ingress/VirtualService routes target it."""
+    reader = _open_reader(db, repo)
+    _emit(queries.find_port(reader, port, _parse_env(env), namespace=namespace), json)
     reader.close()
 
 
@@ -485,10 +577,8 @@ def _find_node_id(reader: GraphReader, focus: str) -> str:
 
 
 def _parse_env(env: Optional[str]) -> Optional[Environment]:
-    if env is None:
-        return None
     try:
-        return Environment(env.lower())
+        return parse_env(env)
     except ValueError:
         valid = ", ".join(e.value for e in Environment)
         raise typer.BadParameter(f"unknown environment {env!r}. Valid: {valid}")
@@ -548,13 +638,15 @@ def _print_summary(report, environment) -> None:
 
     # nodes + edges side by side
     nodes_tbl = Table(title=f"Nodes ({len(graph.nodes)})", title_style="bold", box=None, pad_edge=False)
-    nodes_tbl.add_column("Type"); nodes_tbl.add_column("Count", justify="right")
+    nodes_tbl.add_column("Type")
+    nodes_tbl.add_column("Count", justify="right")
     for typ, n in node_types.most_common():
         icon = _NODE_ICON.get(typ, "•")
         nodes_tbl.add_row(f"[{_NODE_STYLE.get(typ, 'white')}]{icon} {typ}[/]", str(n))
 
     edges_tbl = Table(title=f"Edges ({len(graph.edges)})", title_style="bold", box=None, pad_edge=False)
-    edges_tbl.add_column("Type"); edges_tbl.add_column("Count", justify="right")
+    edges_tbl.add_column("Type")
+    edges_tbl.add_column("Count", justify="right")
     for typ, n in edge_types.most_common():
         edges_tbl.add_row(f"[{_EDGE_STYLE.get(typ, 'white')}]{typ}[/]", str(n))
 

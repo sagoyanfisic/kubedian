@@ -10,10 +10,30 @@ from __future__ import annotations
 from pathlib import Path
 from textwrap import dedent
 
+from kubedian.application.pipeline.discover import discover_overlays
+from kubedian.application.pipeline.extract import extract_overlay
+from kubedian.application.pipeline.resolve import resolve
+from kubedian.domain.entities.graph import Environment
+
 
 def _w(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(dedent(text).lstrip(), encoding="utf-8")
+
+
+def repo_writer(repo: Path):
+    """Writer for inline test repos: ``w("svc/base/x.yaml", yaml_text)``."""
+
+    def w(rel: str, text: str) -> None:
+        _w(repo / rel, text)
+
+    return w
+
+
+def build_graph(repo: Path, environment: Environment = Environment.STAGING):
+    """Run discover → extract → resolve over a test repo."""
+    overlays = discover_overlays(repo, environment)
+    return resolve([extract_overlay(o) for o in overlays])
 
 
 def write_sample_repo(root: Path) -> Path:
@@ -58,6 +78,17 @@ def write_sample_repo(root: Path) -> Path:
               containers:
                 - name: api
                   image: example/service-a:latest
+                  env:
+                    - name: DATABASE_HOST
+                      valueFrom:
+                        secretKeyRef:
+                          name: service-a-secret
+                          key: POSTGRES_HOST
+                    - name: FEATURE_FLAG
+                      valueFrom:
+                        configMapKeyRef:
+                          name: service-a-config
+                          key: feature_flag
                   envFrom:
                     - configMapRef:
                         name: service-discovery
@@ -88,6 +119,21 @@ def write_sample_repo(root: Path) -> Path:
         resources:
           - ../../base
           - secrets.yaml
+          - config.yaml
+        """,
+    )
+    # Plain (non-discovery) configmap consumed key-by-key via valueFrom.
+    _w(
+        repo / "service-a/overlays/staging/config.yaml",
+        """
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: service-a-config
+          namespace: ns-a
+        data:
+          feature_flag: "on"
+          log_level: "info"
         """,
     )
     # SOPS-style secret: plaintext KEYS, encrypted VALUES.
@@ -131,6 +177,9 @@ def write_sample_repo(root: Path) -> Path:
               containers:
                 - name: api
                   image: example/service-b:latest
+                  ports:
+                    - name: http
+                      containerPort: 8080
         """,
     )
     _w(
@@ -145,7 +194,9 @@ def write_sample_repo(root: Path) -> Path:
           selector:
             app: service-b
           ports:
-            - port: 80
+            - name: http
+              port: 80
+              targetPort: http
         """,
     )
     _w(
@@ -200,6 +251,8 @@ def write_sample_repo(root: Path) -> Path:
             - route:
                 - destination:
                     host: service-b.ns-b.svc.cluster.local
+                    port:
+                      number: 8080
         """,
     )
     _w(
@@ -240,6 +293,8 @@ def write_sample_repo(root: Path) -> Path:
                     backend:
                       service:
                         name: gateway
+                        port:
+                          number: 80
         """,
     )
     _w(

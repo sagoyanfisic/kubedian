@@ -1,6 +1,5 @@
 """The index must survive overlays that don't build (raw-YAML fallback)."""
 
-from pathlib import Path
 
 from kubedian.application.pipeline.discover import discover_overlays
 from kubedian.application.pipeline.extract import extract_overlay

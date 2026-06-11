@@ -128,3 +128,109 @@ def test_sync_envs_requires_existing_index(tmp_path):
         assert "kubedian index" in str(exc)
     else:  # pragma: no cover
         raise AssertionError("expected FileNotFoundError when no index exists")
+
+
+def _service_a_secret_edge_attrs(db: Path) -> dict:
+    conn = sqlite3.connect(str(db))
+    try:
+        row = conn.execute(
+            "SELECT attrs FROM edges WHERE src_id = 'svc:ns-a/service-a' "
+            "AND dst_id = ? AND type = 'references'",
+            (_SECRET_ID,),
+        ).fetchone()
+    finally:
+        conn.close()
+    return json.loads(row[0]) if row else {}
+
+
+def test_sync_envs_sweeps_valuefrom_env_map(tmp_path):
+    """Removing the valueFrom block from the deployment must drop the var->key
+    mapping (and the env_key_ref mode) from the REFERENCES edge on sync."""
+    repo = write_sample_repo(tmp_path)
+    db = tmp_path / "graph.db"
+    index_repo(repo, db, Environment.STAGING)
+
+    attrs = _service_a_secret_edge_attrs(db)
+    assert attrs.get("env_map") == {"DATABASE_HOST": "POSTGRES_HOST"}
+    assert "env_key_ref" in attrs.get("modes", [])
+
+    dep = repo / "service-a/base/deployment.yaml"
+    text = dep.read_text(encoding="utf-8")
+    start = text.index("          env:")
+    end = text.index("          envFrom:")
+    dep.write_text(text[:start] + text[end:], encoding="utf-8")
+
+    sync_envs(repo, db, Environment.STAGING)
+    attrs = _service_a_secret_edge_attrs(db)
+    assert "env_map" not in attrs
+    assert attrs.get("modes") == ["env_from"]
+
+
+def test_sync_locator_representative_change_leaves_no_duplicate_rows(tmp_path):
+    """Edge.key excludes source_locator while SQLite's UNIQUE includes it. When
+    the representative locator of a merged edge changes between syncs (here: the
+    reads_from edge keyed on POSTGRES_HOST becomes keyed on DB_HOST), the old row
+    must be swept in the same transaction — never left as a duplicate."""
+    from tests.conftest import repo_writer
+
+    repo = tmp_path / "r"
+    w = repo_writer(repo)
+    w(
+        "billing/base/deployment.yaml",
+        """
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: billing
+          namespace: placeholder
+          labels: {app: billing}
+        spec:
+          template:
+            metadata:
+              labels: {app: billing}
+            spec:
+              containers:
+                - name: api
+                  image: x:1
+                  envFrom:
+                    - secretRef: {name: billing-secret}
+        """,
+    )
+    w("billing/overlays/staging/kustomization.yaml", "namespace: billing\nresources:\n  - ../../base\n  - secrets.yaml\n")
+
+    def _write_secret(key: str) -> None:
+        w(
+            "billing/overlays/staging/secrets.yaml",
+            f"""
+            apiVersion: v1
+            kind: Secret
+            metadata:
+              name: billing-secret
+              namespace: billing
+            stringData:
+              {key}: ENC[AES256_GCM,data:zz==,tag:yy==]
+            sops:
+              encrypted_regex: ^(data|stringData)$
+            """,
+        )
+
+    def _reads_from_rows() -> list[str]:
+        conn = sqlite3.connect(str(db))
+        try:
+            rows = conn.execute(
+                "SELECT source_locator FROM edges WHERE src_id = 'svc:billing/billing' "
+                "AND type = 'reads_from'"
+            ).fetchall()
+        finally:
+            conn.close()
+        return [r[0] for r in rows]
+
+    _write_secret("POSTGRES_HOST")
+    db = tmp_path / "graph.db"
+    index_repo(repo, db, Environment.STAGING)
+    assert _reads_from_rows() == ["POSTGRES_HOST"]
+
+    # Same postgres heuristic, different key name -> same logical edge, new locator.
+    _write_secret("DB_HOST")
+    sync_envs(repo, db, Environment.STAGING)
+    assert _reads_from_rows() == ["DB_HOST"]  # exactly one row, new locator
