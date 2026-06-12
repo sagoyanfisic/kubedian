@@ -92,9 +92,17 @@ kubedian export-mermaid --focus orders-service   # architecture as a Mermaid dia
 kubedian export-docs    --lang all                 # Markdown docs (en/es/pt)
 
 # 4. Serve to AI agents (e.g. Claude Code) over MCP
-kubedian install        # registers the MCP server
-kubedian serve          # or run it directly (stdio)
+kubedian install                 # registers the MCP server (scope: local — this directory only)
+kubedian install --scope user    # … or for every Claude Code session
+kubedian install --scope project # … or in .mcp.json, committed and shared with the team
+kubedian doctor                  # diagnose the connection: binary, DB, registration, live handshake
+kubedian serve                   # or run the server directly (stdio)
 ```
+
+> **Heads-up on scopes**: the default `local` scope means Claude Code only sees kubedian
+> when launched **from the directory where you ran `kubedian install`**. If the tools
+> don't show up, run `kubedian doctor` — it reports where the server is registered.
+> Once connected, ask the agent to call `kubedian_capabilities` for a catalog of every tool.
 
 Add `--json` to any query command for machine-readable output, and `--env` to target a
 specific environment (development | staging | production | test).

@@ -105,6 +105,54 @@ async def test_mcp_config_tools(indexed_db):
         assert any(n["name"] == "service-b" for n in res.data["listeners"])
 
 
+async def test_capabilities_tool(indexed_db):
+    from kubedian import __version__
+    from kubedian.main import mcp
+
+    async with Client(mcp) as client:
+        names = {t.name for t in await client.list_tools()}
+        assert "kubedian_capabilities" in names
+        assert len(names) >= 19
+
+        res = await client.call_tool("kubedian_capabilities", {})
+        data = res.data
+        assert data["server"]["name"] == "Kubedian"
+        assert data["server"]["version"] == __version__
+        listed = {t["name"] for group in data["tools"].values() for t in group}
+        assert listed == names  # the catalog mirrors the live registry
+        assert "other" not in data["tools"]  # every tool has a category
+        assert "service_context" in data["suggested_entry_points"]
+        assert data["index"]["service_count"] > 0
+
+
+async def test_server_version_is_package_version(indexed_db):
+    from kubedian import __version__
+    from kubedian.main import mcp
+
+    async with Client(mcp) as client:
+        assert client.initialize_result.serverInfo.version == __version__
+
+
+async def test_missing_db_clear_error(tmp_path, monkeypatch):
+    """A missing index must surface as an actionable message, not a raw traceback."""
+    from fastmcp.exceptions import ToolError
+
+    from kubedian.main import mcp
+    from kubedian.presentation.tools.dependencies import reset_reader
+
+    monkeypatch.setenv("KUBEDIAN_DB", str(tmp_path / "nope.db"))
+    reset_reader()
+    try:
+        async with Client(mcp) as client:
+            with pytest.raises(ToolError, match="no index at"):
+                await client.call_tool("index_status", {})
+            # capabilities still answers, reporting the broken index instead of failing
+            res = await client.call_tool("kubedian_capabilities", {})
+            assert "no index at" in res.data["index"]["error"]
+    finally:
+        reset_reader()
+
+
 async def test_mcp_composition_and_namespace_tools(indexed_db):
     from kubedian.main import mcp
 

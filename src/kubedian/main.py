@@ -6,12 +6,16 @@ Run over stdio (default, for Claude Code) or HTTP. The DB is selected via the
 
 from __future__ import annotations
 
+import logging
 import os
+import sys
 
 from fastmcp import FastMCP
 
+from kubedian import __version__
 from kubedian.presentation.tools.config_tools import register_config_tools
 from kubedian.presentation.tools.datastore_tools import register_datastore_tools
+from kubedian.presentation.tools.help_tools import register_help_tools
 from kubedian.presentation.tools.namespace_tools import register_namespace_tools
 from kubedian.presentation.tools.service_tools import register_service_tools
 from kubedian.presentation.tools.status_tools import register_status_tools
@@ -38,16 +42,19 @@ INSTRUCTIONS = (
     "(development|staging|production|test, default production)."
 )
 
-mcp = FastMCP(name="Kubedian", instructions=INSTRUCTIONS)
+mcp = FastMCP(name="Kubedian", instructions=INSTRUCTIONS, version=__version__)
 
 register_service_tools(mcp)
 register_config_tools(mcp)
 register_datastore_tools(mcp)
 register_namespace_tools(mcp)
 register_status_tools(mcp)
+register_help_tools(mcp)
 
 
 def main() -> None:
+    # stdout is the protocol channel on stdio — everything else goes to stderr.
+    logging.basicConfig(stream=sys.stderr, level=os.getenv("KUBEDIAN_LOG_LEVEL", "WARNING"))
     transport = os.getenv("KUBEDIAN_MCP_TRANSPORT", "stdio")
     if transport == "http":
         mcp.run(
@@ -56,7 +63,7 @@ def main() -> None:
             port=int(os.getenv("UVICORN_PORT", "8000")),
         )
     else:
-        mcp.run()
+        mcp.run(show_banner=False)
 
 
 if __name__ == "__main__":
