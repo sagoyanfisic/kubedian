@@ -16,7 +16,12 @@ from pathlib import Path
 from kubedian.config import default_db_path, parse_env
 from kubedian.infrastructure.sqlite.graph_reader import GraphReader
 
-__all__ = ["get_reader", "reset_reader", "resolve_db_path", "parse_env"]
+try:  # the core package must keep working without the mcp extra
+    from fastmcp.exceptions import ToolError
+except ImportError:  # pragma: no cover
+    ToolError = RuntimeError  # type: ignore[assignment, misc]
+
+__all__ = ["ToolError", "get_reader", "reset_reader", "resolve_db_path", "parse_env"]
 
 _lock = threading.Lock()
 _reader: GraphReader | None = None
@@ -49,7 +54,14 @@ def get_reader() -> GraphReader:
                     _reader.close()
                 except Exception:  # pragma: no cover - close is best-effort
                     pass
-            _reader = GraphReader(Path(key[0]), check_same_thread=False)
+            try:
+                _reader = GraphReader(Path(key[0]), check_same_thread=False)
+            except FileNotFoundError as exc:
+                # ToolError messages reach the MCP client verbatim — make it actionable.
+                raise ToolError(
+                    f"{exc} Set KUBEDIAN_DB (currently resolving to {key[0]}) "
+                    "or run: kubedian index --repo <manifests-repo>"
+                ) from exc
             _reader_key = key
         return _reader
 

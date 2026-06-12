@@ -486,16 +486,31 @@ def datastore_clients_cmd(
     reader.close()
 
 
+_MCP_SCOPES = ("local", "user", "project")
+_SCOPE_VISIBILITY = {
+    "local": "only when Claude Code runs in {cwd} (stored under projects in ~/.claude.json)",
+    "user": "every Claude Code session for this user",
+    "project": ".mcp.json in the project root — commit it to share with the team",
+}
+
+
 @app.command()
 def install(
     repo: Optional[Path] = typer.Option(None, "--repo", "-r", help="Manifests repo (its .kubedian/graph.db is used)."),
     db: Optional[Path] = typer.Option(None, "--db", help="Path to graph.db."),
     name: str = typer.Option("kubedian", "--name", help="MCP server name to register."),
+    scope: str = typer.Option(
+        "local", "--scope",
+        help="Claude Code scope: local (this directory only), user (all your sessions), "
+             "or project (.mcp.json committed to the repo).",
+    ),
 ) -> None:
     """Install the kubedian MCP server into Claude Code (via `claude mcp add`)."""
     import shutil
     import subprocess
 
+    if scope not in _MCP_SCOPES:
+        raise typer.BadParameter(f"unknown scope {scope!r}. Valid: {', '.join(_MCP_SCOPES)}")
     db_path = _resolve_db(db, repo)
     mcp_bin = _mcp_binary()
     if shutil.which("claude") is None:
@@ -504,11 +519,13 @@ def install(
         raise typer.Exit(1)
     # Use the absolute path: the agent spawns the command in an env whose PATH
     # may not include ~/.local/bin, so a bare `kubedian-mcp` would fail to start.
-    cmd = ["claude", "mcp", "add", name, "--env", f"KUBEDIAN_DB={db_path}", "--", mcp_bin]
+    cmd = ["claude", "mcp", "add", name, "--scope", scope, "--env", f"KUBEDIAN_DB={db_path}", "--", mcp_bin]
     typer.echo("$ " + " ".join(cmd))
     rc = subprocess.run(cmd).returncode
     if rc == 0:
-        typer.secho(f"✓ Registered MCP server '{name}' in Claude Code.", fg=typer.colors.GREEN)
+        typer.secho(f"✓ Registered MCP server '{name}' in Claude Code (scope: {scope}).", fg=typer.colors.GREEN)
+        typer.echo(f"  Visible in: {_SCOPE_VISIBILITY[scope].format(cwd=Path.cwd())}")
+        typer.echo("  Check the connection any time with: kubedian doctor")
     else:
         typer.secho("Registration failed. Manual config:", fg=typer.colors.YELLOW)
         typer.echo(_manual_mcp_config(name, db_path))
@@ -525,6 +542,167 @@ def uninstall(name: str = typer.Option("kubedian", "--name", help="MCP server na
         raise typer.BadParameter("`claude` CLI not found.")
     rc = subprocess.run(["claude", "mcp", "remove", name]).returncode
     raise typer.Exit(rc)
+
+
+@app.command()
+def doctor(
+    db: Optional[Path] = typer.Option(None, "--db", help="Path to graph.db."),
+    repo: Optional[Path] = typer.Option(None, "--repo", "-r", help="Repo (to locate its .kubedian/graph.db)."),
+    name: str = typer.Option("kubedian", "--name", help="MCP server name to look for."),
+    json: bool = typer.Option(False, "--json"),
+    timeout: float = typer.Option(10.0, "--timeout", help="Handshake timeout in seconds."),
+) -> None:
+    """Diagnose the MCP connection: binary, fastmcp, graph DB, Claude Code registration
+    and a live stdio handshake against the real server."""
+    from kubedian.presentation.tools.dependencies import resolve_db_path
+
+    # Without flags, resolve exactly like the server would (KUBEDIAN_DB/KUBEDIAN_REPO/cwd).
+    db_path = _resolve_db(db, repo) if (db or repo) else resolve_db_path()
+    checks = [
+        _doctor_binary(),
+        _doctor_fastmcp(),
+        _doctor_db(db_path),
+        _doctor_registration(name, db_path),
+    ]
+    if checks[0][1] and checks[1][1]:
+        checks.append(_doctor_handshake(_mcp_binary(), db_path, timeout))
+    else:
+        checks.append(("MCP handshake", None, "skipped (binary or fastmcp missing)"))
+
+    if json:
+        typer.echo(_json.dumps([{"check": c, "ok": ok, "detail": d} for c, ok, d in checks], indent=2))
+    else:
+        _print_doctor(checks)
+    if any(ok is False for _, ok, _ in checks):
+        raise typer.Exit(1)
+
+
+def _doctor_binary() -> tuple[str, Optional[bool], str]:
+    mcp_bin = _mcp_binary()
+    if Path(mcp_bin).exists():
+        return ("kubedian-mcp binary", True, mcp_bin)
+    return ("kubedian-mcp binary", False, f"{mcp_bin} not found — pip install 'kubedian[mcp]'")
+
+
+def _doctor_fastmcp() -> tuple[str, Optional[bool], str]:
+    import importlib.util
+
+    if importlib.util.find_spec("fastmcp") is not None:
+        return ("fastmcp installed", True, "import ok")
+    return ("fastmcp installed", False, "missing — pip install 'kubedian[mcp]'")
+
+
+def _doctor_db(db_path: Path) -> tuple[str, Optional[bool], str]:
+    if not db_path.exists():
+        return ("graph DB", False, f"no index at {db_path} — run: kubedian index --repo <manifests-repo>")
+    try:
+        reader = GraphReader(db_path)
+        try:
+            st = queries.status(reader)
+        finally:
+            reader.close()
+    except Exception as exc:
+        return ("graph DB", False, f"{db_path}: {exc}")
+    return (
+        "graph DB", True,
+        f"{db_path} — indexed_at={st.get('indexed_at')} services={st.get('service_count')} "
+        f"edges={st.get('edge_count')} render_failures={st.get('render_failures')}",
+    )
+
+
+def _find_mcp_registrations(name: str) -> list[tuple[str, str, dict]]:
+    """(scope, where, server-config) for every registration of `name` in Claude Code.
+
+    Reads the config files directly — `claude mcp list` would spawn and health-check
+    every registered server."""
+    hits: list[tuple[str, str, dict]] = []
+    user_cfg = Path.home() / ".claude.json"
+    if user_cfg.exists():
+        try:
+            data = _json.loads(user_cfg.read_text())
+        except (OSError, ValueError):
+            data = {}
+        if name in (data.get("mcpServers") or {}):
+            hits.append(("user", str(user_cfg), data["mcpServers"][name]))
+        for proj, pdata in (data.get("projects") or {}).items():
+            servers = (pdata or {}).get("mcpServers") or {}
+            if name in servers:
+                hits.append(("local", proj, servers[name]))
+    proj_cfg = Path.cwd() / ".mcp.json"
+    if proj_cfg.exists():
+        try:
+            data = _json.loads(proj_cfg.read_text())
+        except (OSError, ValueError):
+            data = {}
+        if name in (data.get("mcpServers") or {}):
+            hits.append(("project", str(proj_cfg), data["mcpServers"][name]))
+    return hits
+
+
+def _doctor_registration(name: str, db_path: Path) -> tuple[str, Optional[bool], str]:
+    hits = _find_mcp_registrations(name)
+    if not hits:
+        return (
+            "Claude Code registration", None,
+            f"'{name}' not registered — run: kubedian install (add --scope user for all sessions)",
+        )
+    lines = []
+    for scope, where, cfg in hits:
+        env_db = (cfg.get("env") or {}).get("KUBEDIAN_DB")
+        db_note = ""
+        if env_db:
+            db_note = f", KUBEDIAN_DB={'ok' if Path(env_db).exists() else 'MISSING'} ({env_db})"
+        lines.append(f"scope={scope} at {where} → {cfg.get('command', '?')}{db_note}")
+    bad = any("MISSING" in line for line in lines)
+    return ("Claude Code registration", not bad, "; ".join(lines))
+
+
+def _doctor_handshake(mcp_bin: str, db_path: Path, timeout: float) -> tuple[str, Optional[bool], str]:
+    import asyncio
+    import os
+
+    try:
+        from fastmcp import Client
+        from fastmcp.client.transports import StdioTransport
+    except ImportError as exc:  # pragma: no cover - guarded by the fastmcp check
+        return ("MCP handshake", False, str(exc))
+
+    transport = StdioTransport(
+        command=mcp_bin, args=[],
+        env={**os.environ, "KUBEDIAN_DB": str(db_path)},
+        keep_alive=False,
+    )
+
+    async def go() -> tuple[int, str]:
+        async with Client(transport) as client:
+            tools = await client.list_tools()
+            info = client.initialize_result.serverInfo
+            return len(tools), f"{info.name} {info.version}"
+
+    try:
+        n, server = asyncio.run(asyncio.wait_for(go(), timeout))
+    except Exception as exc:
+        return ("MCP handshake", False, f"{type(exc).__name__}: {exc}")
+    return ("MCP handshake", True, f"{server} — {n} tools over stdio")
+
+
+def _print_doctor(checks: list[tuple[str, Optional[bool], str]]) -> None:
+    icons = {True: "✓", False: "✗", None: "•"}
+    try:
+        from rich.console import Console
+        from rich.table import Table
+    except ImportError:  # pragma: no cover
+        for label, ok, detail in checks:
+            typer.echo(f"{icons[ok]} {label}: {detail}")
+        return
+    style = {True: "green", False: "red", None: "yellow"}
+    table = Table(title="kubedian doctor", box=None, pad_edge=False)
+    table.add_column("")
+    table.add_column("Check", style="bold")
+    table.add_column("Detail")
+    for label, ok, detail in checks:
+        table.add_row(f"[{style[ok]}]{icons[ok]}[/]", label, detail)
+    Console().print(table)
 
 
 def _mcp_binary() -> str:
